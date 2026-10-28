@@ -1,0 +1,8 @@
+name: Userscripts
+description: Hosts the Stash downloader Tampermonkey userscripts with one-click install and copy buttons.
+version: 1.0.0
+ui:
+  javascript:
+    - nav.js
+  assets:
+    /: app

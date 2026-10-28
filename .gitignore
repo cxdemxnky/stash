@@ -64,3 +64,8 @@ node_modules
 dist
 .DS_Store
 /.local*
+
+# custom plugins: Python caches, and the userscripts built by userscripts/build.py
+# (they embed this machine's downloader address and token)
+__pycache__/
+/plugins/userscripts/app/scripts/

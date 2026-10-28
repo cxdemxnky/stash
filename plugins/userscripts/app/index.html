@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stash Userscripts</title>
+<style>
+  :root { --bg: #202b33; --card: #30404d; --text: #f5f8fa; --muted: #a7b6c2; --accent: #137cbd; --ok: #2e8b57; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { margin: 0 0 4px; font-size: 1.6rem; }
+  a { color: #48aff0; }
+  .lead { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 4px; font-size: 1.1rem; }
+  .card p { margin: 0 0 12px; color: var(--muted); }
+  .meta { font-size: 0.8rem; color: var(--muted); margin-bottom: 12px; word-break: break-all; }
+  .btn { display: inline-block; padding: 7px 14px; margin: 0 8px 8px 0; border-radius: 6px; border: 0;
+    background: #394b59; color: var(--text); font: inherit; cursor: pointer; text-decoration: none; }
+  .btn.primary { background: var(--accent); }
+  .btn.ok { background: var(--ok); }
+  ol { padding-left: 20px; color: var(--muted); }
+  code { background: #182026; padding: 1px 5px; border-radius: 4px; }
+  textarea { position: fixed; left: -9999px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Downloader userscripts</h1>
+  <p class="lead">Tampermonkey scripts that add checkboxes to videos on member sites and send the selection to the Stash downloader.</p>
+
+  <div class="card">
+    <h2>Setup</h2>
+    <ol>
+      <li>Install <a href="https://www.tampermonkey.net/" target="_blank" rel="noopener">Tampermonkey</a> in your browser.</li>
+      <li>Click <b>Install</b> below (Tampermonkey opens its install page), or <b>Copy</b> and paste into a new Tampermonkey script.</li>
+      <li>The scripts send downloads to <code id="service">…</code>. If that changes, use the Tampermonkey menu: <i>Set downloader address</i>.</li>
+      <li>Downloader status: <a id="status-link" href="#" target="_blank" rel="noopener">open status page</a>.</li>
+    </ol>
+  </div>
+
+  <div id="scripts"></div>
+</main>
+<script>
+  function copyText(text, btn) {
+    function done() {
+      var old = btn.textContent;
+      btn.textContent = "Copied";
+      btn.className = "btn ok";
+      setTimeout(function () { btn.textContent = old; btn.className = "btn"; }, 1500);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done);
+      return;
+    }
+    // plain-http LAN pages have no Clipboard API
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    done();
+  }
+
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  fetch("scripts/index.json", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(function (idx) {
+      document.getElementById("service").textContent = idx.service;
+      document.getElementById("status-link").href = idx.service + "/";
+      var list = document.getElementById("scripts");
+      idx.scripts.forEach(function (s) {
+        var card = el("div", { class: "card" });
+        card.appendChild(el("h2", null, s.name));
+        card.appendChild(el("p", null, s.description));
+        card.appendChild(el("div", { class: "meta" }, "v" + s.version + " · runs on " + s.match.join(", ")));
+        card.appendChild(el("a", { class: "btn primary", href: s.file }, "Install"));
+        var copy = el("button", { class: "btn", type: "button" }, "Copy");
+        copy.onclick = function () {
+          fetch(s.file, { cache: "no-store" }).then(function (r) { return r.text(); }).then(function (t) { copyText(t, copy); });
+        };
+        card.appendChild(copy);
+        card.appendChild(el("a", { class: "btn", href: s.file, target: "_blank", rel: "noopener" }, "View source"));
+        list.appendChild(card);
+      });
+    })
+    .catch(function () {
+      document.getElementById("scripts").textContent = "No scripts built yet - run userscripts/build.py.";
+    });
+</script>
+</body>
+</html>
