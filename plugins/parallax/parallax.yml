@@ -1,0 +1,13 @@
+name: Parallax Studio
+description: Turn an image or a paused scene frame into a parallax clip. The person is cut out, the background filled in, and the move is edited on an NLE-style timeline with keyframes and captions; exports are imported as scenes tagged "Parallax". Needs the downloader service (and its ML models) and the Slideshow plugin's caption fonts.
+version: 1.0.0
+ui:
+  javascript:
+    - render.js
+    - studio.js
+    - buttons.js
+  css:
+    - parallax.css
+  csp:
+    connect-src:
+      - "http://*:10141"
