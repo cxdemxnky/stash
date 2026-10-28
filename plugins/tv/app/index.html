@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stash TV</title>
+<link rel="stylesheet" href="tv.css">
+</head>
+<body>
+<div id="list" class="view">
+  <div id="header">
+    <span id="brand">Stash TV</span>
+    <input id="search" class="focusable" type="text" placeholder="Search">
+    <a href="#" class="focusable btn sort" data-sort="created_at">Recently added</a>
+    <a href="#" class="focusable btn sort" data-sort="date">Newest</a>
+    <a href="#" class="focusable btn sort" data-sort="play_count">Most viewed</a>
+    <a href="#" class="focusable btn sort" data-sort="random">Random</a>
+  </div>
+  <div id="status"></div>
+  <div id="grid"></div>
+  <div id="pager">
+    <a href="#" id="prev" class="focusable btn">&laquo; Prev</a>
+    <span id="pageinfo"></span>
+    <a href="#" id="next" class="focusable btn">Next &raquo;</a>
+  </div>
+</div>
+
+<div id="player" class="view hidden">
+  <video id="video" autoplay preload="auto"></video>
+  <div id="spinner" class="hidden">Loading&hellip;</div>
+  <div id="osd">
+    <div id="osd-title"></div>
+    <div id="osd-bar"><div id="osd-progress"></div></div>
+    <div id="osd-time"></div>
+    <div id="osd-buttons">
+      <a href="#" class="focusable btn" data-act="back">&#8592; Back</a>
+      <a href="#" class="focusable btn" data-act="-300">-5m</a>
+      <a href="#" class="focusable btn" data-act="-30">-30s</a>
+      <a href="#" class="focusable btn" data-act="play" id="btn-play">Pause</a>
+      <a href="#" class="focusable btn" data-act="30">+30s</a>
+      <a href="#" class="focusable btn" data-act="300">+5m</a>
+      <a href="#" class="focusable btn" data-act="quality" id="btn-quality">Direct</a>
+      <a href="#" class="focusable btn" data-act="fullscreen">Fullscreen</a>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+<script src="tv.js"></script>
+</body>
+</html>

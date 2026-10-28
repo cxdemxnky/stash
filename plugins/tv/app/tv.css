@@ -1,0 +1,132 @@
+/* Deliberately plain CSS (no flexbox/grid/variables) for old TV browsers. */
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #111;
+  color: #eee;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 20px;
+}
+.hidden { display: none !important; }
+
+.btn {
+  display: inline-block;
+  padding: 10px 18px;
+  margin: 0 6px 6px 0;
+  background: #2b2b2b;
+  color: #eee;
+  text-decoration: none;
+  border: 3px solid transparent;
+  border-radius: 6px;
+}
+.btn.active { background: #3a5a8c; }
+
+.focusable:focus, .focused {
+  outline: none;
+  border-color: #f5c518 !important;
+}
+
+#header { padding: 20px 30px 10px; }
+#brand { font-size: 30px; font-weight: bold; margin-right: 20px; vertical-align: middle; }
+#search {
+  font-size: 20px;
+  padding: 10px;
+  width: 260px;
+  margin-right: 12px;
+  background: #222;
+  color: #eee;
+  border: 3px solid #444;
+  border-radius: 6px;
+  vertical-align: middle;
+}
+#status { padding: 0 30px; color: #aaa; min-height: 24px; }
+
+#grid { padding: 10px 20px; font-size: 0; }
+.card {
+  display: inline-block;
+  vertical-align: top;
+  width: 23%;
+  margin: 0 1% 20px;
+  font-size: 18px;
+  color: #eee;
+  text-decoration: none;
+  border: 4px solid transparent;
+  border-radius: 6px;
+  background: #1c1c1c;
+}
+.card:focus, .card.focused {
+  -webkit-transform: scale(1.04);
+  transform: scale(1.04);
+}
+.thumb {
+  position: relative;
+  width: 100%;
+  padding-top: 56.25%;
+  background: #000 no-repeat center center;
+  background-size: cover;
+}
+.thumb .dur {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.75);
+  font-size: 16px;
+}
+.thumb .resume {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 5px;
+  background: #f5c518;
+}
+.card .title {
+  padding: 8px 10px;
+  height: 46px;
+  overflow: hidden;
+  line-height: 23px;
+}
+.card .meta { padding: 0 10px 8px; font-size: 15px; color: #999; white-space: nowrap; overflow: hidden; }
+
+#pager { padding: 10px 30px 40px; text-align: center; }
+#pageinfo { margin: 0 20px; color: #aaa; }
+
+#player {
+  position: fixed;
+  left: 0; top: 0; right: 0; bottom: 0;
+  background: #000;
+}
+#video { width: 100%; height: 100%; background: #000; }
+#spinner {
+  position: absolute;
+  left: 0; right: 0; top: 45%;
+  text-align: center;
+  font-size: 28px;
+}
+#osd {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  padding: 20px 40px 30px;
+  background: rgba(0, 0, 0, 0.8);
+}
+#osd.faded { display: none; }
+/* fullscreen mode: only the video is shown until any button is pressed */
+#player.fullscreen #osd, #player.fullscreen #spinner { display: none; }
+#player.fullscreen #video { cursor: none; }
+body.fullscreen #toast { display: none !important; }
+#osd-title { font-size: 24px; margin-bottom: 12px; white-space: nowrap; overflow: hidden; }
+#osd-bar { height: 10px; background: #444; margin-bottom: 8px; }
+#osd-progress { height: 10px; width: 0; background: #f5c518; }
+#osd-time { margin-bottom: 14px; color: #ccc; }
+
+#toast {
+  position: fixed;
+  left: 50%;
+  top: 30px;
+  width: 500px;
+  margin-left: -250px;
+  padding: 14px;
+  text-align: center;
+  background: #3a5a8c;
+  border-radius: 6px;
+}

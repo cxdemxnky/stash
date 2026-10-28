@@ -222,6 +222,16 @@ func Initialize() (*Server, error) {
 	r.Mount("/downloads", server.getDownloadsRoutes())
 	r.Mount("/plugin", server.getPluginRoutes())
 
+	// /tv is the lightweight TV player page served by the tv plugin.
+	// Plugins can only serve assets under /plugin/{id}/assets, so redirect there.
+	r.Get("/tv", func(w http.ResponseWriter, r *http.Request) {
+		target := getProxyPrefix(r) + "/plugin/tv/assets/"
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+	})
+
 	r.HandleFunc("/css", cssHandler(cfg))
 	r.HandleFunc("/javascript", javascriptHandler(cfg))
 	r.HandleFunc("/customlocales", customLocalesHandler(cfg))

@@ -1,0 +1,10 @@
+name: TV
+description: Lightweight /tv page for older TV browsers, and a Cast to TV button on scene pages.
+version: 1.0.0
+ui:
+  javascript:
+    - cast.js
+  css:
+    - cast.css
+  assets:
+    /: app

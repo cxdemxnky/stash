@@ -1,0 +1,23 @@
+#tv-cast-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2000;
+  padding: 10px 18px;
+  border-radius: 6px;
+  background: #30404d;
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+#tv-cast-toast.show {
+  opacity: 1;
+}
+
+#tv-cast-toast.error {
+  background: #a82a2a;
+}
