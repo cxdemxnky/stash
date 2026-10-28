@@ -1,0 +1,10 @@
+name: Shows
+description: A "Shows" section listing groups tagged "Show" with their seasons and episodes, styled after PlayboyTV.
+version: 1.0.0
+ui:
+  javascript:
+    - shows.js
+  css:
+    - shows.css
+  assets:
+    /fonts: fonts
