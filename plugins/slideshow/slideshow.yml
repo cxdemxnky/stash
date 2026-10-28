@@ -1,0 +1,10 @@
+name: Slideshow
+description: A full-screen image slideshow at /slideshow with Ken Burns movement, transitions, captions (fonts, blend modes), tag and orientation filters.
+version: 1.0.0
+ui:
+  javascript:
+    - slideshow.js
+  css:
+    - slideshow.css
+  assets:
+    /fonts: fonts

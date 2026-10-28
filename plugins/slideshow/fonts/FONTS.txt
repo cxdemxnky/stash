@@ -1,0 +1,11 @@
+Caption fonts, all from github.com/google/fonts (ofl/<name>), licensed under the
+SIL Open Font License 1.1 (text in OFL.txt):
+
+  AlfaSlabOne-Regular.ttf    ofl/alfaslabone
+  Anton-Regular.ttf          ofl/anton
+  ArchivoBlack-Regular.ttf   ofl/archivoblack
+  Bungee-Regular.ttf         ofl/bungee
+  LilitaOne-Regular.ttf      ofl/lilitaone
+  TitanOne-Regular.ttf       ofl/titanone
+  Rubik-Variable.ttf         ofl/rubik/Rubik[wght].ttf
+  Montserrat-Variable.ttf    ofl/montserrat/Montserrat[wght].ttf
