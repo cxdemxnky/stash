@@ -1,0 +1,27 @@
+name: FreeOnes Auto-Scrape
+description: Scrapes new performers from FreeOnes (built-in scraper) as they are created, with tasks to scrape existing performers.
+version: 1.0.0
+exec:
+  - freeones-autoscrape.js
+interface: js
+hooks:
+  - name: Scrape new performer
+    description: Fills in a newly created performer's details and image from FreeOnes.
+    triggeredBy:
+      - Performer.Create.Post
+    defaultArgs:
+      mode: hook
+tasks:
+  - name: Scrape unscraped performers
+    description: Scrapes every performer this plugin hasn't scraped yet.
+    defaultArgs:
+      mode: unscraped
+  - name: Scrape performers without an image
+    description: Scrapes every performer that has no image, including ones scraped before.
+    defaultArgs:
+      mode: noimage
+settings:
+  overwrite:
+    displayName: Overwrite existing details
+    description: Replace fields that already have a value (by default only empty fields are filled).
+    type: BOOLEAN
