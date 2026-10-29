@@ -115,6 +115,24 @@
   };
   const CAPTION_KEYS = Object.keys(CAPTION_PARAMS);
 
+  // Element layers: parts cut out of the person layer onto planes of their own,
+  // keyframed per layer (times absolute). Depth is where the plane sits: 0 = with the
+  // person, 1 = at the background, below 0 in front of the person. Position and size
+  // are on top of the person's own (Person X/Y/size); size and the rotations are around
+  // the element's centre: Z in the layer's own plane (positive = clockwise), then X
+  // (positive brings the top nearer), then Y (positive brings the left side nearer).
+  const LAYER_PARAMS = {
+    depth: { label: "Depth", hint: "0 = with the person, 1 = at the background, negative = in front of the person", min: -0.9, max: 1, step: 0.01, def: 0, fmt: (v) => (v === 0 ? "person" : v.toFixed(2)) },
+    x: { label: "Position X", min: -1, max: 1, step: 0.005, def: 0, fmt: (v) => Math.round(v * 100) + "%" },
+    y: { label: "Position Y", min: -1, max: 1, step: 0.005, def: 0, fmt: (v) => Math.round(v * 100) + "%" },
+    size: { label: "Size", min: 0.2, max: 3, step: 0.01, def: 1, fmt: (v) => v.toFixed(2) + "×" },
+    rotX: { label: "Rotate X", hint: "Tilts the layer around its horizontal axis (positive brings the top nearer)", min: -85, max: 85, step: 0.5, def: 0, fmt: (v) => v.toFixed(1) + "°" },
+    rotY: { label: "Rotate Y", hint: "Turns the layer around its vertical axis (positive brings the left side nearer)", min: -85, max: 85, step: 0.5, def: 0, fmt: (v) => v.toFixed(1) + "°" },
+    rotate: { label: "Rotate Z", hint: "Turns the layer in its own plane (positive = clockwise)", min: -180, max: 180, step: 0.5, def: 0, fmt: (v) => v.toFixed(1) + "°" },
+    opacity: { label: "Opacity", min: 0, max: 1, step: 0.01, def: 1, fmt: (v) => Math.round(v * 100) + "%" },
+  };
+  const LAYER_KEYS = Object.keys(LAYER_PARAMS);
+
   // A smoothed value: a monotone cubic (Fritsch-Carlson) through the keyframes, so
   // it flows through them without stopping, never overshoots a neighbouring
   // keyframe's value, and starts and ends gently. kfs are sorted by time.
@@ -181,6 +199,10 @@
 
   function captionAt(cap, t) {
     return interpolate(cap.keyframes, t - cap.start, CAPTION_PARAMS, cap.smooth);
+  }
+
+  function layerAt(layer, t) {
+    return interpolate(layer.keyframes, t, LAYER_PARAMS, layer.smooth);
   }
 
   // An image cover-fitted to the frame: half-extents in frame widths/heights (>= 0.5)
@@ -293,7 +315,45 @@
     const fgAnchorY = fgEdges && fgEdges.bottom ? 0.5 : o.v; // the bottom of the frame
     const bgArgs = [l.db, px, py, s.bgScale || 1, o.u, o.v, l.mb, s.bgPos];
     const fgArgs = [l.dp, 0, 0, s.fgScale || 1, o.u, fgAnchorY, 1, s.fgPos];
+    // an element layer's plane: v = its values (layerAt), centre = the element's centre
+    // in the photo (0..1). At depth 0, size 1 and no move it lies exactly on the person.
+    const gap = l.db - l.dp;
+    const layer = (v, centre) => {
+      const z = Math.max(l.dp * 0.1, l.dp + gap * v.depth);
+      const m = (l.F + z - l.dp) / l.F;
+      const kf = s.fgScale || 1;
+      const E = [l.cx + (ext.bx + (centre[0] - 0.5) * 2 * ext.ex) * m, l.cy + (ext.by + (centre[1] - 0.5) * 2 * ext.ey) * l.a * m];
+      const A = [l.cx + o.u * m, l.cy + fgAnchorY * l.a * m];
+      const C = [l.cx + ext.bx * m, l.cy + ext.by * l.a * m];
+      // its own size around its centre, then the person's around the orbit point
+      const C1 = [E[0] + (C[0] - E[0]) * v.size, E[1] + (C[1] - E[1]) * v.size];
+      const off = [(s.fgPos[0] + v.x) * m, (s.fgPos[1] + v.y) * l.a * m];
+      const cx = A[0] + (C1[0] - A[0]) * kf + off[0];
+      const cy = A[1] + (C1[1] - A[1]) * kf + off[1];
+      const hw = ext.ex * m * v.size * kf;
+      const hh = ext.ey * l.a * m * v.size * kf;
+      // the corners turned around the element's centre (where it ends up), then as project()
+      const P = [A[0] + (E[0] - A[0]) * kf + off[0], A[1] + (E[1] - A[1]) * kf + off[1]];
+      const rad = (d) => ((d || 0) * Math.PI) / 180;
+      const [cz, sz] = [Math.cos(rad(v.rotate)), Math.sin(rad(v.rotate))];
+      const [cxr, sxr] = [Math.cos(rad(v.rotX)), Math.sin(rad(v.rotX))];
+      const [cyr, syr] = [Math.cos(rad(v.rotY)), Math.sin(rad(v.rotY))];
+      return [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([sx, sy]) => {
+        const dx = cx + sx * hw - P[0];
+        const dy = cy + sy * hh - P[1];
+        // Z (in the plane), then X, then Y
+        const x1 = dx * cz - dy * sz;
+        const y1 = dx * sz + dy * cz;
+        const y2 = y1 * cxr;
+        const z2 = y1 * sxr;
+        const x3 = x1 * cyr - z2 * syr;
+        const z3 = x1 * syr + z2 * cyr;
+        const [X, Y, Z] = rotate(l.R, [P[0] + x3, P[1] + y2, z + z3], l.T);
+        return { x: (W * l.F * X) / Z, y: (W * l.F * Y) / Z, z: Math.max(1e-3, Z) };
+      });
+    };
     return {
+      layer,
       bg: rect(l.mb * (cb || 1), ...bgArgs, ext),
       fg: rect(1, ...fgArgs, ext),
       // where the frame would be on each layer: a caption attached to a layer is
@@ -596,11 +656,13 @@
     return t >= cap.start && t <= cap.end && [cap.text, cap.text2].some((s) => s && s.trim());
   }
 
-  // Draws a caption flat in frame coordinates; the caller sets blending.
-  function drawCaptionText(ctx, cap, t, W, H) {
-    if (!captionVisible(cap, t)) return;
+  // Where a caption's text goes at t, flat in frame coordinates: its lines and sizes,
+  // the block's box (left, top, blockW, blockH, before moving), and its centre (cx,
+  // cy), rotation and scale. null when it doesn't show. ctx measures the text.
+  function captionLayout(ctx, cap, t, W, H) {
+    if (!captionVisible(cap, t)) return null;
     const lines = [cap.text, cap.text2].filter((s) => s && s.trim());
-    if (!lines.length) return;
+    if (!lines.length) return null;
     const f = fontFor(cap.font);
     const m = Math.min(W, H);
     const px = (cap.size / 100) * m;
@@ -620,7 +682,7 @@
     else if (cap.anim === "pop") { scale = p < 0.7 ? 0.6 + (0.46 * p) / 0.7 : 1.06 - (0.06 * (p - 0.7)) / 0.3; alpha *= Math.min(1, p / 0.7); }
     const anim = captionAt(cap, t);
     alpha *= Math.max(0, Math.min(1, anim.opacity));
-    if (alpha <= 0 || anim.scale <= 0) return;
+    if (alpha <= 0 || anim.scale <= 0) return null;
 
     const sizes = lines.map((_, i) => (i === 0 && cap.text && cap.text.trim() ? px : px * 0.5));
     const texts = lines.map((s) => (cap.uppercase ? s.toUpperCase() : s));
@@ -644,12 +706,23 @@
     const padY = 0.06 * m;
     const left = hz === "left" ? padX : hz === "right" ? W - padX - blockW : (W - blockW) / 2;
     const top = v === "top" ? padY : v === "bottom" ? H - 0.09 * m - blockH : (H - blockH) / 2;
+    return {
+      texts, sz, gaps, lineH, widths, blockW, blockH, left, top, hz, alpha, setFont,
+      cx: left + blockW / 2 + dx + anim.x * W, cy: top + blockH / 2 + dy + anim.y * H,
+      rotate: (anim.rotate * Math.PI) / 180, scale: scale * anim.scale,
+    };
+  }
 
+  // Draws a caption flat in frame coordinates; the caller sets blending.
+  function drawCaptionText(ctx, cap, t, W, H) {
+    const L = captionLayout(ctx, cap, t, W, H);
+    if (!L) return;
+    const { texts, sz, gaps, lineH, widths, blockW, blockH, left, top, hz, setFont } = L;
     ctx.save();
-    ctx.globalAlpha *= alpha;
-    ctx.translate(left + blockW / 2 + dx + anim.x * W, top + blockH / 2 + dy + anim.y * H);
-    ctx.rotate((anim.rotate * Math.PI) / 180);
-    ctx.scale(scale * anim.scale, scale * anim.scale);
+    ctx.globalAlpha *= L.alpha;
+    ctx.translate(L.cx, L.cy);
+    ctx.rotate(L.rotate);
+    ctx.scale(L.scale, L.scale);
     ctx.translate(-(left + blockW / 2), -(top + blockH / 2));
     ctx.textBaseline = "alphabetic";
     let y = top;
@@ -683,6 +756,104 @@
     });
     ctx.restore();
   }
+
+  // ------------------------------------------------------------ captions on the preview
+
+  // The 3x3 homography taking the unit square (0,0)(1,0)(0,1)(1,1) to the quad
+  // q0 q1 q2 q3 (points [x, y]), and back.
+  function squareToQuad([p0, p1, p2, p3]) {
+    // corners in the order (0,0) (1,0) (1,1) (0,1)
+    const [x0, y0] = p0, [x1, y1] = p1, [x2, y2] = p3, [x3, y3] = p2;
+    const sx = x0 - x1 + x2 - x3, sy = y0 - y1 + y2 - y3;
+    const dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2;
+    const den = dx1 * dy2 - dx2 * dy1;
+    const g = (sx * dy2 - dx2 * sy) / den;
+    const h = (dx1 * sy - sx * dy1) / den;
+    return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h, 1];
+  }
+  function invert3([a, b, c, d, e, f, g, h, i]) {
+    const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    const det = a * A + b * B + c * C;
+    return [A, -(b * i - c * h), b * f - c * e, B, a * i - c * g, -(a * f - c * d), C, -(a * h - b * g), a * e - b * d].map((v) => v / det);
+  }
+  function apply3(m, x, y) {
+    const w = m[6] * x + m[7] * y + m[8];
+    return [(m[0] * x + m[1] * y + m[2]) / w, (m[3] * x + m[4] * y + m[5]) / w];
+  }
+
+  // A preview point (x, y: frame units from the centre, as the screen shows it) on a
+  // caption's own flat frame (0..W, 0..H, what drawCaptionText draws on), through the
+  // plane it is attached to. null when the plane faces away.
+  function captionFlatPoint(project, images, cap, t, W, H, cover, x, y) {
+    const m = captionMap(project, images, cap, t, W, H, cover);
+    return m && m.toFlat(x, y);
+  }
+
+  // Both ways between the preview (frame units from the centre) and a caption's flat
+  // frame: {toFlat(x, y), toScreen(fx, fy)}; null when its plane faces away.
+  function captionMap(project, images, cap, t, W, H, cover) {
+    const attach = captionAttach(cap);
+    const cam = cameraAt(project.keyframes, t, project.smooth);
+    let quad = null;
+    let c = 1;
+    if (attach === "camera") quad = captionPlane(cam, W, H);
+    else if (attach !== "screen" && images.bg && images.fg) {
+      const photo = { iw: images.fg.naturalWidth || images.fg.width, ih: images.fg.naturalHeight || images.fg.height };
+      const pl = planes(cam, photo, W, H, (cover || {}).cb || 1, images.pad, images.fgEdges);
+      quad = attach === "background" ? pl.bgFrame : pl.fgFrame;
+      c = (cover || {}).c || 1;
+    }
+    if (!quad) return { toFlat: (x, y) => ({ x: x + W / 2, y: y + H / 2 }), toScreen: (fx, fy) => ({ x: fx - W / 2, y: fy - H / 2 }) };
+    if (quad.some((v) => v.z < 1e-3)) return null;
+    const fwd = squareToQuad(quad.map((v) => [v.x * c, v.y * c]));
+    const inv = invert3(fwd);
+    return {
+      toFlat: (x, y) => { const [u, v] = apply3(inv, x, y); return { x: u * W, y: v * H }; },
+      toScreen: (fx, fy) => { const [x, y] = apply3(fwd, fx / W, fy / H); return { x, y }; },
+    };
+  }
+
+  // A caption's box on the preview, for its handles: the corners (top-left, top-right,
+  // bottom-right, bottom-left), the rotate handle above its top edge and the centre,
+  // in preview frame units from the centre; plus its layout. null when not showing.
+  function captionFrame(project, images, cap, t, W, H, cover) {
+    if (!measureCanvas) measureCanvas = document.createElement("canvas");
+    const L = captionLayout(measureCanvas.getContext("2d"), cap, t, W, H);
+    const m = L && captionMap(project, images, cap, t, W, H, cover);
+    if (!m) return null;
+    const pad = 0.015 * Math.min(W, H);
+    const hw = L.blockW / 2 * L.scale + pad, hh = L.blockH / 2 * L.scale + pad;
+    const cs = Math.cos(L.rotate), sn = Math.sin(L.rotate);
+    // a point in the box's own (scaled, unrotated) frame, onto the screen
+    const at = (lx, ly) => m.toScreen(L.cx + lx * cs - ly * sn, L.cy + lx * sn + ly * cs);
+    return {
+      layout: L, centre: at(0, 0),
+      corners: [at(-hw, -hh), at(hw, -hh), at(hw, hh), at(-hw, hh)],
+      top: at(0, -hh), rotate: at(0, -hh - 0.06 * Math.min(W, H)),
+    };
+  }
+
+  // The caption under a preview point, topmost first (the order they're drawn in,
+  // reversed), with that point on its flat frame; null when none is there.
+  function pickCaption(project, images, t, W, H, cover, x, y) {
+    if (!measureCanvas) measureCanvas = document.createElement("canvas");
+    const ctx = measureCanvas.getContext("2d");
+    const caps = (project.captions || []).filter((cap) => captionVisible(cap, t));
+    const order = [...caps.filter((cap) => captionAttach(cap) === "background"), ...caps.filter((cap) => captionAttach(cap) !== "background")];
+    for (const cap of order.reverse()) {
+      const L = captionLayout(ctx, cap, t, W, H);
+      const p = L && captionFlatPoint(project, images, cap, t, W, H, cover, x, y);
+      if (!p) continue;
+      // into the block's own unrotated, unscaled frame, with a little slack
+      const dx = p.x - L.cx, dy = p.y - L.cy;
+      const lx = (dx * Math.cos(-L.rotate) - dy * Math.sin(-L.rotate)) / L.scale;
+      const ly = (dx * Math.sin(-L.rotate) + dy * Math.cos(-L.rotate)) / L.scale;
+      const slack = 0.02 * Math.min(W, H) / L.scale;
+      if (Math.abs(lx) <= L.blockW / 2 + slack && Math.abs(ly) <= L.blockH / 2 + slack) return { cap, point: p };
+    }
+    return null;
+  }
+  let measureCanvas = null;
 
   // ------------------------------------------------------------ frame
 
@@ -751,6 +922,14 @@
       ctx.globalCompositeOperation = "source-over";
       gw.begin(ow, oh);
       const seq = images.fgSeq;
+      // the element layers cut out of the person, drawn far to near with the person
+      const parts = seq && seq.length > 1 ? [] : (project.layers || []).map((layer) => {
+        const img = images.layers && images.layers[layer.id];
+        return img && { img: img.canvas, centre: img.centre, v: layerAt(layer, t) };
+      }).filter((x) => x && x.v.opacity > 0);
+      parts.sort((a, b) => b.v.depth - a.v.depth);
+      const drawPart = (part) => gw.quad(part.img, pl.layer(part.v, part.centre), W, H, c, false, Math.min(1, part.v.opacity));
+      parts.filter((part) => part.v.depth > 0).forEach(drawPart);
       if (seq && seq.length > 1) {
         // bullet time: the frame at this point of the action, blended into the next
         const f = Math.max(0, Math.min(1, cam.action ?? 0)) * (seq.length - 1);
@@ -762,8 +941,9 @@
         if (frac < 0.999) gw.quad(seq[i], pl.fg, W, H, c, false, 1 - frac, true);
         if (frac > 0.001) gw.quad(seq[i + 1], pl.fg, W, H, c, false, frac, true);
       } else {
-        gw.quad(images.fg, pl.fg, W, H, c);
+        gw.quad(images.fgCut || images.fg, pl.fg, W, H, c);
       }
+      parts.filter((part) => part.v.depth <= 0).forEach(drawPart);
       ctx.drawImage(gw.canvas, 0, 0, W, H);
     }
     caps.filter((cap) => captionAttach(cap) !== "background").forEach(drawCaption);
@@ -771,7 +951,7 @@
   }
 
   window.ParallaxRender = {
-    PARAMS, PARAM_KEYS, CAPTION_PARAMS, CAPTION_KEYS, CAPTION_EFFECTS, EASES, PRESET_BEZ, interpolate, cameraAt, captionAt, captionAttach, planes, extent,
-    orbitOnScreen, pickOrbit, personCentre, visibleBox, stillToView, coverFactor, touchingEdges, drawFrame, loadFont, fonts, fontFor,
+    PARAMS, PARAM_KEYS, CAPTION_PARAMS, CAPTION_KEYS, LAYER_PARAMS, LAYER_KEYS, layerAt, CAPTION_EFFECTS, EASES, PRESET_BEZ, interpolate, cameraAt, captionAt, captionAttach, planes, extent,
+    orbitOnScreen, pickOrbit, pickCaption, captionFlatPoint, captionFrame, captionLayout, personCentre, visibleBox, stillToView, coverFactor, touchingEdges, drawFrame, loadFont, fonts, fontFor,
   };
 })();

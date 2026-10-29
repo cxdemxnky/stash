@@ -29,6 +29,11 @@ POST /parallax/project/<id>/delete
 POST /parallax/project/<id>/duplicate         a new version: a copy with no export, titled "... vN"
 POST /parallax/cut                            {source, settings} -> {job}
 POST /parallax/extend                         {source_key, cut} -> {job}: outpaint an older cut's background
+POST /parallax/segment                        {source_key, cut, points: [[x, y, 1|0]]} -> {masks: [{mask: data URL,
+                                              score, area}], pick}: click-to-select (MobileSAM) on the cut's
+                                              person layer; one click gives up to 3 sizes, smallest first
+POST /parallax/mask                           {source_key, png: data URL} -> {file}: a layer's mask, kept
+                                              with the source's cuts (masks/<id>.png)
 POST /parallax/export/<id>/start              {width, height, fps, frames}
 POST /parallax/export/<id>/frames             raw concatenated JPEGs
 POST /parallax/export/<id>/finish             -> {scene_id, path}
@@ -63,6 +68,9 @@ import uuid
 PARALLAX_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parallax.py")
 UPSCALE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscale.py")
 INTERPOLATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpolate.py")
+SEGMENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segment.py")
+SEGMENT_MODELS = ("mobile_sam_image_encoder.onnx", "sam_mask_decoder_multi.onnx")
+SEGMENT_IDLE = 300  # seconds without clicks before the segment worker (and its GPU memory) goes
 # option: (mode, factor, file suffix, title suffix, tag); {fps} is the new frame rate
 FPS_OPTIONS = {
     "clip": ("clip", 1, "", "", None),  # markers: just the part, no AI frames
@@ -152,6 +160,11 @@ class Parallax:
         self.fps_proc = None
         self.load_ai_jobs()
         threading.Thread(target=self.run_fps, daemon=True).start()
+        # click-to-select: one long-lived worker, so clicks don't each load the model
+        self.seg_proc = None
+        self.seg_lock = threading.Lock()
+        self.seg_used = 0
+        threading.Thread(target=self.reap_segmenter, daemon=True).start()
 
     # ------------------------------------------------------------ status
 
@@ -165,6 +178,8 @@ class Parallax:
         elif not shutil.which("ffmpeg"):
             reason = "ffmpeg not found"
         models = ["human"] + [k for k, f in OPTIONAL_MODELS.items() if os.path.exists(os.path.join(self.models_dir, f))]
+        if all(os.path.exists(os.path.join(self.models_dir, f)) for f in SEGMENT_MODELS):
+            models.append("segment")
         return {"enabled": reason is None, "reason": reason, "models": models}
 
     # ------------------------------------------------------------ projects
@@ -476,6 +491,78 @@ class Parallax:
         err = p.stderr.read()
         if p.wait() != 0:
             raise RuntimeError(error or err.strip()[-400:] or "parallax.py failed")
+
+    # ------------------------------------------------------------ element layers
+
+    def cut_dir(self, key, cid):
+        if not re.match(r"^[\w-]+$", cid or ""):
+            raise ValueError("bad cut id")
+        d = os.path.join(self.layer_dir(key), cid)
+        if not os.path.isfile(os.path.join(d, "person.png")):
+            raise KeyError("no such cut")
+        return d
+
+    def segment(self, body):
+        """A mask of what the clicks pick out on a cut's person layer."""
+        d = self.cut_dir(body.get("source_key"), body.get("cut"))
+        pts = [[float(x), float(y), 1 if lab else 0] for x, y, lab in body.get("points") or []][:32]
+        if not pts:
+            raise ValueError("no points")
+        req = json.dumps({"person": os.path.join(d, "person.png"), "background": os.path.join(d, "background.png"),
+                          "cache": os.path.join(d, "sam_embedding.npy"), "points": pts}) + "\n"
+        with self.seg_lock:
+            for attempt in (0, 1):
+                if self.seg_proc is None or self.seg_proc.poll() is not None:
+                    self.seg_proc = subprocess.Popen(
+                        [self.python, "-I", SEGMENT_SCRIPT, "--models", self.models_dir],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                    ready = self.seg_proc.stdout.readline()
+                    if not ready:
+                        self.seg_proc = None
+                        raise RuntimeError("the segment worker didn't start")
+                try:
+                    self.seg_proc.stdin.write(req)
+                    self.seg_proc.stdin.flush()
+                    line = self.seg_proc.stdout.readline()
+                except (BrokenPipeError, OSError):
+                    line = ""
+                if line:
+                    break
+                self.seg_proc = None  # it died: start a fresh one once
+            self.seg_used = time.time()
+        if not line:
+            raise RuntimeError("the segment worker stopped")
+        out = json.loads(line)
+        if "error" in out:
+            raise RuntimeError(out["error"])
+        for m in out["masks"]:
+            m["mask"] = "data:image/png;base64," + m["mask"]
+        return out
+
+    def reap_segmenter(self):
+        while True:
+            time.sleep(30)
+            with self.seg_lock:
+                if self.seg_proc and self.seg_proc.poll() is None and time.time() - self.seg_used > SEGMENT_IDLE:
+                    self.seg_proc.stdin.close()
+                    try:
+                        self.seg_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.seg_proc.kill()
+                    self.seg_proc = None
+                    log("segment worker stopped (idle)")
+
+    def save_mask(self, body):
+        png = body.get("png") or ""
+        if not png.startswith("data:image/png;base64,"):
+            raise ValueError("png must be a PNG data URL")
+        key = body.get("source_key")
+        d = os.path.join(self.layer_dir(key), "masks")
+        os.makedirs(d, exist_ok=True)
+        name = uuid.uuid4().hex[:12] + ".png"
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(base64.b64decode(png.split(",", 1)[1]))
+        return {"file": "layers/%s/masks/%s" % (key, name)}
 
     def file(self, rel):
         rel = urllib.parse.unquote(rel)
@@ -1083,6 +1170,10 @@ class Parallax:
                 if m.group(2) == "/duplicate":
                     return 200, self.duplicate_project(m.group(1))
                 return 200, self.save_project(m.group(1), body)
+            if p == "segment":
+                return 200, self.segment(body)
+            if p == "mask":
+                return 200, self.save_mask(body)
             if p in ("cut", "extend"):
                 if not self.status()["enabled"]:
                     return 503, {"error": self.status()["reason"]}

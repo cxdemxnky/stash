@@ -765,3 +765,65 @@
 /* changed on the preview, not keyed: orange until keyed */
 .pxs-prow.pending .pxs-prow-label,
 .pxs-prow.pending .pxs-prow-value { color: #ff8a3d; }
+
+/* ------------------------------------------------------------ caption handles */
+
+.pxs-cap-frame { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; z-index: 2; }
+.pxs-cap-frame polygon { fill: none; stroke: #6cb4ff; stroke-width: 1; stroke-dasharray: 4 3; }
+.pxs-cap-frame line { stroke: #6cb4ff; stroke-width: 1; }
+.pxs-cap-handle { fill: #fff; stroke: #2a7fd4; stroke-width: 1.5; pointer-events: all; }
+.pxs-cap-handle:hover { fill: #6cb4ff; }
+
+/* ------------------------------------------------------------ element layers */
+
+.pxs-clip-layer { background: #2f8f6a; cursor: pointer; }
+.pxs-clip-layer.active { box-shadow: inset 0 0 0 2px #fff; }
+
+.pxs-cutter {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: #0b0b0d;
+}
+
+.pxs-cutter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #222;
+}
+
+.pxs-cutter-name { width: 150px; }
+.pxs-cutter-size { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aaa; }
+.pxs-cutter-size input { width: 110px; }
+
+.pxs-cutter-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+}
+
+.pxs-cutter-view { max-width: 100%; max-height: 100%; cursor: crosshair; touch-action: none; }
+.pxs-cutter-view.brush { cursor: cell; }
+.pxs-cutter-hint { padding: 4px 10px 8px; font-size: 12px; color: #8a8a96; }
+.pxs-cutter-sizes { display: inline-flex; align-items: center; gap: 4px; }
+.pxs-cutter-edge { padding-top: 0; }
+.pxs-layer-edge { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 8px 0; }
+.pxs-layer-edge .pxs-cutter-size input { width: 100px; }
+.pxs-cutter-body { position: relative; }
+.pxs-brush {
+  position: absolute;
+  display: none;
+  border: 2px solid #7fc4ff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.pxs-cutter-view.brush { cursor: none; }

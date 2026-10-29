@@ -110,14 +110,21 @@
   // bullet: the source is a bullet-time sequence, whose action then runs from the
   // first frame to the last over the clip (a linear ramp: steady slow motion).
   // Only the values that move are keyed; the rest stay at their defaults.
-  // p as it would be with the values in pend keyed at time t
-  function withPending(p, t, pend) {
-    if (!pend) return p;
-    const at = p.keyframes.find((k) => Math.abs(k.t - t) < 0.5 / (p.fps || 30));
+  // kfs with the values in pend keyed at time t
+  function keyedAt(kfs, t, pend, fps) {
+    const at = kfs.find((k) => Math.abs(k.t - t) < 0.5 / fps);
+    return at ? kfs.map((k) => (k === at ? { ...k, ...pend } : k)) : [...kfs, { id: "pending", t, ...pend, ease: "inout" }];
+  }
+  // p as it would be with the camera values in pend, and the caption values in
+  // capPend ({caption id: values}), keyed at time t
+  function withPending(p, t, pend, capPend) {
+    if (!pend && !capPend) return p;
+    const fps = p.fps || 30;
     return {
       ...p,
-      keyframes: at ? p.keyframes.map((k) => (k === at ? { ...k, ...pend } : k))
-        : [...p.keyframes, { id: "pending", t, ...pend, ease: "inout" }],
+      keyframes: pend ? keyedAt(p.keyframes, t, pend, fps) : p.keyframes,
+      captions: !capPend ? p.captions : p.captions.map((c) =>
+        (capPend[c.id] ? { ...c, keyframes: keyedAt(c.keyframes || [], t - c.start, capPend[c.id], fps) } : c)),
     };
   }
 
@@ -179,6 +186,7 @@
       keyframes: migrate((p.keyframes && p.keyframes.length ? p.keyframes : defaultKeyframes(length, !!(p.source && p.source.span)))
         .map(({ rotate, skew, ...k }) => (p.sparse ? k : { ...base, ...legacy, roll: rotate ?? base.roll, ...k })), P),
       // captions that followed the camera now sit on the person's plane; flat ones on the screen
+      layers: (p.layers || []).map((l) => ({ keyframes: [], ...l })),
       captions: (p.captions || []).map(({ follow, ...c }) => ({
         attach: follow === false ? "screen" : "person",
         effects: [{ id: newId(), type: "fade", in: false, inDur: 0.5, out: true, outDur: 0.25 }],
@@ -371,7 +379,7 @@
     );
   }
 
-  function MediaBin({ project, cuts, cut, urls, status, job, onUseCut, onRecut }) {
+  function MediaBin({ project, cuts, cut, urls, status, job, onUseCut, onRecut, onCutElement, onSelectLayer, selectedLayer }) {
     const [form, setForm] = React.useState({
       model: "human", people: "all", soft: 2, grow: 0, fill: "lama", interp: (cut && cut.meta.interp) || 1, upscale: (cut && cut.meta.upscale) || 1,
     });
@@ -389,6 +397,17 @@
         h("span", null, sourceLabel(project.source))),
       cut && h("div", { className: "pxs-bin-item" }, h("img", { src: urls.bg, alt: "" }), h("span", null, "Background")),
       cut && h("div", { className: "pxs-bin-item pxs-checker" }, h("img", { src: urls.fg, alt: "" }), h("span", null, "Person")),
+
+      cut && h("h5", null, "Elements"),
+      cut && (project.layers || []).map((l) =>
+        h("button", { key: l.id, className: "pxs-cut" + (selectedLayer === l.id ? " active" : ""), onClick: () => onSelectLayer(l.id) }, l.name || "Element")),
+      cut && h("button", {
+        className: "pxs-button", onClick: onCutElement,
+        disabled: bullet || !(status?.models || []).includes("segment"),
+        title: bullet ? "Not for bullet-time projects (the person moves between frames)"
+          : (status?.models || []).includes("segment") ? "Cut a part of the person (an arm, a phone, hair…) onto a layer of its own, with its own depth and keyframes"
+            : "Needs the MobileSAM models in the downloader's models folder",
+      }, "\u2702 Cut out element"),
 
       h("h5", null, "Re-cut"),
       h("label", null, "Finder",
@@ -434,6 +453,514 @@
     );
   }
 
+  // ---------------------------------------------------------------- element layers
+
+  function newCanvas(w, h) {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    return c;
+  }
+  // a mask image (white on black, or white with alpha) as alpha on a canvas
+  function drawMaskAlpha(canvas, img) {
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const a = d.data;
+    for (let i = 0; i < a.length; i += 4) {
+      a[i + 3] = (a[i + 3] * Math.max(a[i], a[i + 1], a[i + 2])) / 255;
+      a[i] = a[i + 1] = a[i + 2] = 255;
+    }
+    ctx.putImageData(d, 0, 0);
+    return canvas;
+  }
+  // the middle of what a mask covers, as fractions of its size
+  function maskCentre(canvas) {
+    const { width: w, height: hh } = canvas;
+    const a = canvas.getContext("2d").getImageData(0, 0, w, hh).data;
+    let x0 = w, y0 = hh, x1 = -1, y1 = -1;
+    for (let y = 0; y < hh; y += 2) {
+      for (let x = 0; x < w; x += 2) {
+        if (a[(y * w + x) * 4 + 3] > 127) {
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+        }
+      }
+    }
+    return x1 < 0 ? [0.5, 0.5] : [(x0 + x1) / 2 / w, (y0 + y1) / 2 / hh];
+  }
+
+  // Layers can be cut from the person or from another layer (layer.from = its id).
+  // The ids of a layer's layers cut from it, and theirs, and so on.
+  function descendants(layers, id) {
+    const out = new Set();
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const l of layers) if (l.from && (l.from === id || out.has(l.from)) && !out.has(l.id)) { out.add(l.id); grew = true; }
+    }
+    return out;
+  }
+  // layers with each one after the layer it's cut from (a missing source: the person)
+  function sourceOrder(layers) {
+    const ids = new Set(layers.map((l) => l.id));
+    const done = new Set();
+    const out = [];
+    for (let pass = 0; pass <= layers.length && out.length < layers.length; pass++) {
+      for (const l of layers) {
+        if (done.has(l.id)) continue;
+        if (!l.from || !ids.has(l.from) || done.has(l.from) || pass === layers.length) { out.push(l); done.add(l.id); }
+      }
+    }
+    return out;
+  }
+
+  // How a layer's edge is cut: margin (px) grows the selection out into its
+  // surroundings, soften (px, "Feather") fades the layer out to fully transparent beyond
+  // that, and person keeps it to what it's cut from (off: the pixels come from the photo,
+  // surroundings and all).
+  const EDGE_DEFAULT = { margin: 0, soften: 0, person: true };
+  const edgeOf = (layer) => ({ ...EDGE_DEFAULT, ...((layer && layer.edge) || {}) });
+
+  // Distances in pixels (1 across, √2 diagonally) from the set pixels of a mask (w wide,
+  // 0/1) over the window [x0, x1) x [y0, y1), row by row from (x0, y0); 1e9 = none near.
+  function distances(set, w, x0, y0, x1, y1) {
+    const ww = x1 - x0;
+    const wh = y1 - y0;
+    const D = new Float32Array(ww * wh);
+    const R2 = Math.SQRT2;
+    for (let y = 0; y < wh; y++) for (let x = 0; x < ww; x++) D[y * ww + x] = set[(y + y0) * w + x + x0] ? 0 : 1e9;
+    for (let y = 0; y < wh; y++) {
+      for (let x = 0; x < ww; x++) {
+        const i = y * ww + x;
+        let d = D[i];
+        if (d === 0) continue;
+        if (x > 0) d = Math.min(d, D[i - 1] + 1);
+        if (y > 0) {
+          d = Math.min(d, D[i - ww] + 1);
+          if (x > 0) d = Math.min(d, D[i - ww - 1] + R2);
+          if (x < ww - 1) d = Math.min(d, D[i - ww + 1] + R2);
+        }
+        D[i] = d;
+      }
+    }
+    for (let y = wh - 1; y >= 0; y--) {
+      for (let x = ww - 1; x >= 0; x--) {
+        const i = y * ww + x;
+        let d = D[i];
+        if (d === 0) continue;
+        if (x < ww - 1) d = Math.min(d, D[i + 1] + 1);
+        if (y < wh - 1) {
+          d = Math.min(d, D[i + ww] + 1);
+          if (x < ww - 1) d = Math.min(d, D[i + ww + 1] + R2);
+          if (x > 0) d = Math.min(d, D[i + ww - 1] + R2);
+        }
+        D[i] = d;
+      }
+    }
+    return D;
+  }
+
+  // A layer's two shapes from its selection (an alpha canvas) and what it's cut from
+  // (src, whose alpha is that layer's): cut = what it takes out of src, solid; alpha =
+  // the layer itself, solid over cut and feathered out beyond it to fully transparent.
+  // src's faint soft edge goes with whichever is nearer, the selection or the rest of
+  // src, so none of it stays behind as a ghost outline.
+  function maskShapes(sel, src, edge) {
+    const e = { ...EDGE_DEFAULT, ...(edge || {}) };
+    const { width: w, height: hh } = sel;
+    const S = sel.getContext("2d").getImageData(0, 0, w, hh).data;
+    const sa = newCanvas(w, hh);
+    sa.getContext("2d").drawImage(src, 0, 0, w, hh);
+    const A = sa.getContext("2d").getImageData(0, 0, w, hh).data;
+    const set = new Uint8Array(w * hh);
+    let x0 = w, y0 = hh, x1 = -1, y1 = -1;
+    for (let y = 0; y < hh; y++) {
+      for (let x = 0; x < w; x++) {
+        if (S[(y * w + x) * 4 + 3] > 127) {
+          set[y * w + x] = 1;
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+        }
+      }
+    }
+    const cut = newCanvas(w, hh);
+    const alpha = newCanvas(w, hh);
+    if (x1 < 0) return { cut, alpha };
+    const fringe = Math.ceil(Math.max(w, hh) * 0.04);
+    const pad = 2 * fringe + e.margin + e.soften + 2;
+    const X0 = Math.max(0, x0 - pad), Y0 = Math.max(0, y0 - pad), X1 = Math.min(w, x1 + pad + 1), Y1 = Math.min(hh, y1 + pad + 1);
+    const ww = X1 - X0;
+    const at = (i) => ((i / ww) | 0) * w + (i % ww) + X0 + Y0 * w; // window index -> image index
+    const n = ww * (Y1 - Y0);
+    // the soft edge: faint pixels nearer the selection than the rest go with it
+    const rest = new Uint8Array(w * hh);
+    for (let i = 0; i < w * hh; i++) rest[i] = !set[i] && A[i * 4 + 3] >= 200 ? 1 : 0;
+    const dS = distances(set, w, X0, Y0, X1, Y1);
+    const dR = distances(rest, w, X0, Y0, X1, Y1);
+    for (let i = 0; i < n; i++) {
+      const j = at(i);
+      const a = A[j * 4 + 3];
+      if (!set[j] && a > 0 && a < 200 && dS[i] <= fringe && dS[i] < dR[i]) set[j] = 1;
+    }
+    // the margin
+    if (e.margin > 0) {
+      const d = distances(set, w, X0, Y0, X1, Y1);
+      for (let i = 0; i < n; i++) if (d[i] <= e.margin) set[at(i)] = 1;
+    }
+    const dF = e.soften > 0 ? distances(set, w, X0, Y0, X1, Y1) : null;
+    const cx = cut.getContext("2d");
+    const ax = alpha.getContext("2d");
+    const C = cx.createImageData(w, hh);
+    const L = ax.createImageData(w, hh);
+    // (kept to what it's cut from by drawing that through alpha, whose own alpha it has)
+    for (let i = 0; i < n; i++) {
+      const j = at(i);
+      const k = j * 4;
+      let v = 0;
+      if (set[j]) {
+        v = 1;
+        C.data[k] = C.data[k + 1] = C.data[k + 2] = C.data[k + 3] = 255; // all of it goes
+      } else if (dF && dF[i] < e.soften) {
+        const u = 1 - dF[i] / e.soften;
+        v = u * u * (3 - 2 * u); // smooth fade to nothing
+      }
+      if (v > 0) {
+        L.data[k] = L.data[k + 1] = L.data[k + 2] = 255;
+        L.data[k + 3] = 255 * v;
+      }
+    }
+    cx.putImageData(C, 0, 0);
+    ax.putImageData(L, 0, 0);
+    return { cut, alpha };
+  }
+
+  // Cutting an element out of the person layer: clicks on the photo pick it out with
+  // MobileSAM (click = part of it, Alt- or right-click = not part of it), and a brush
+  // adds or erases by hand. The result keeps to the person, and to what other layers
+  // haven't taken already. layer: the layer whose cut-out is being changed, or null.
+  function ElementCutter({ project, cut, images, source, layer, from: from0, onSave, onCancel }) {
+    const fg = images.fg;
+    const all = project.layers || [];
+    // what it's cut from: the person, or a layer (not this one or one cut from it)
+    const mine = layer ? descendants(all, layer.id).add(layer.id) : new Set();
+    const sources = all.filter((l) => !mine.has(l.id) && images.layers && images.layers[l.id]);
+    const [from, setFrom] = React.useState(sources.some((l) => l.id === from0) ? from0 : null);
+    const fromLayer = from && sources.find((l) => l.id === from);
+    // its pixels as they were before anything was cut from it
+    const fromPixels = fromLayer ? images.layers[from].full : fg;
+    const brushRef = React.useRef(null);
+    const w = fg.naturalWidth;
+    const hh = fg.naturalHeight;
+    const viewRef = React.useRef(null);
+    const bufs = React.useRef(null);
+    if (!bufs.current) bufs.current = { sam: newCanvas(w, hh), add: newCanvas(w, hh), erase: newCanvas(w, hh), out: newCanvas(w, hh), tint: newCanvas(w, hh) };
+    const [points, setPoints] = React.useState([]);
+    const [tool, setTool] = React.useState("click");
+    const [brush, setBrush] = React.useState(Math.round(Math.max(w, hh) / 40));
+    const [busy, setBusy] = React.useState(false);
+    const [saving, setSaving] = React.useState(false);
+    const [err, setErr] = React.useState(null);
+    const [name, setName] = React.useState(layer ? layer.name : `Element ${(project.layers || []).length + 1}`);
+    const [edge, setEdge] = React.useState(edgeOf(layer));
+    const [show, setShow] = React.useState("select"); // or "result": the layer on a checkerboard
+    const maxEdge = Math.round(Math.max(w, hh) / 10);
+    const [ver, setVer] = React.useState(0);
+    const [photo, setPhoto] = React.useState(null);
+    // one click's guesses (smallest first) and the one in use
+    const [options, setOptions] = React.useState([]);
+    const [pick, setPick] = React.useState(0);
+    const redraw = () => setVer((v) => v + 1);
+
+    React.useEffect(() => { if (source) loadImage(source).then(setPhoto, () => {}); }, [source]);
+    // changing a layer's cut-out starts from what it has
+    React.useEffect(() => {
+      if (!layer) return;
+      fileUrl(layer.mask).then(loadImage).then((img) => { drawMaskAlpha(bufs.current.add, img); redraw(); }, (e) => setErr(e.message));
+    }, []);
+
+    // the clicks, through the model (only the latest answer counts)
+    const req = React.useRef(0);
+    React.useEffect(() => {
+      const b = bufs.current;
+      const n = ++req.current;
+      if (!points.length) {
+        b.sam.getContext("2d").clearRect(0, 0, w, hh);
+        setOptions([]);
+        setBusy(false);
+        return redraw();
+      }
+      setBusy(true);
+      setErr(null);
+      api("segment", { source_key: project.source_key, cut: cut.id, points })
+        .then(async (r) => {
+          const imgs = await Promise.all(r.masks.map((m) => loadImage(m.mask)));
+          if (n !== req.current) return;
+          setOptions(r.masks.map((m, i) => ({ img: imgs[i], area: m.area })));
+          setPick(r.pick);
+        })
+        .catch((e) => n === req.current && setErr(e.message))
+        .finally(() => n === req.current && setBusy(false));
+    }, [points]);
+    React.useEffect(() => {
+      if (!options[pick]) return;
+      drawMaskAlpha(bufs.current.sam, options[pick].img);
+      redraw();
+    }, [options, pick]);
+    const smaller = () => setPick((i) => Math.max(0, i - 1));
+    const larger = () => setPick((i) => Math.min(options.length - 1, i + 1));
+
+    // the selection: (model + brush) - eraser, minus other layers; final() adds the edge
+    function compose() {
+      const b = bufs.current;
+      const ctx = b.out.getContext("2d");
+      ctx.globalCompositeOperation = "source-over";
+      ctx.clearRect(0, 0, w, hh);
+      // the model's edge, grown a little: it stops short of the person's soft edge,
+      // which would otherwise stay behind on the person layer as a faint outline
+      const grow = Math.max(2, Math.round(Math.max(w, hh) / 300));
+      for (let a = 0; a < 16; a++) ctx.drawImage(b.sam, Math.round(Math.cos((a * Math.PI) / 8) * grow), Math.round(Math.sin((a * Math.PI) / 8) * grow));
+      ctx.drawImage(b.add, 0, 0);
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(b.erase, 0, 0);
+      // not what other layers have (other than its source and what's cut from this one)
+      Object.entries(images.layers || {}).forEach(([id, l]) => { if (!mine.has(id) && id !== from) ctx.drawImage(l.canvas, 0, 0, w, hh); });
+      ctx.globalCompositeOperation = "source-over";
+      return b.out;
+    }
+    const final = () => maskShapes(compose(), fromPixels, edge);
+
+    React.useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      const k = Math.min(1, 1600 / Math.max(w, hh));
+      view.width = Math.round(w * k);
+      view.height = Math.round(hh * k);
+      const ctx = view.getContext("2d");
+      const shapes = final();
+      if (show === "result") {
+        // the layer as it will be, on a checkerboard: its feathered edge shows
+        const sq = 12;
+        for (let y = 0; y < view.height; y += sq) {
+          for (let x = 0; x < view.width; x += sq) {
+            ctx.fillStyle = ((x + y) / sq) % 2 ? "#3a3a40" : "#26262b";
+            ctx.fillRect(x, y, sq, sq);
+          }
+        }
+        const lc = bufs.current.tint.getContext("2d");
+        lc.globalCompositeOperation = "source-over";
+        lc.clearRect(0, 0, w, hh);
+        lc.drawImage(edge.person || !photo ? fromPixels : photo, 0, 0, w, hh);
+        lc.globalCompositeOperation = "destination-in";
+        lc.drawImage(shapes.alpha, 0, 0);
+        ctx.drawImage(bufs.current.tint, 0, 0, view.width, view.height);
+        return;
+      }
+      ctx.drawImage(photo || images.bg, 0, 0, view.width, view.height);
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; // the person stands out from the rest
+      ctx.fillRect(0, 0, view.width, view.height);
+      ctx.drawImage(fromPixels, 0, 0, view.width, view.height); // what it can be cut from, bright
+      const out = shapes.alpha;
+      const tint = bufs.current.tint.getContext("2d");
+      tint.globalCompositeOperation = "source-over";
+      tint.fillStyle = "#2f8cff";
+      tint.fillRect(0, 0, w, hh);
+      tint.globalCompositeOperation = "destination-in";
+      tint.drawImage(out, 0, 0);
+      if (edge.person) tint.drawImage(fromPixels, 0, 0, w, hh); // only what it can take
+      ctx.globalAlpha = 0.6;
+      ctx.drawImage(bufs.current.tint, 0, 0, view.width, view.height);
+      ctx.globalAlpha = 1;
+      points.forEach(([x, y, lab]) => {
+        ctx.beginPath();
+        ctx.arc(x * k, y * k, 7, 0, Math.PI * 2);
+        ctx.fillStyle = lab ? "#3ddc84" : "#ff4d4d";
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#fff";
+        ctx.stroke();
+      });
+    }, [ver, photo, points, edge, from, show]);
+
+    const imagePoint = (e) => {
+      const r = viewRef.current.getBoundingClientRect();
+      return [((e.clientX - r.left) / r.width) * w, ((e.clientY - r.top) / r.height) * hh];
+    };
+    function paint(x, y) {
+      const b = bufs.current;
+      const [on, off] = tool === "add" ? [b.add, b.erase] : [b.erase, b.add];
+      const c1 = on.getContext("2d");
+      c1.fillStyle = "#fff";
+      c1.beginPath();
+      c1.arc(x, y, brush, 0, Math.PI * 2);
+      c1.fill();
+      const c2 = off.getContext("2d");
+      c2.globalCompositeOperation = "destination-out";
+      c2.beginPath();
+      c2.arc(x, y, brush, 0, Math.PI * 2);
+      c2.fill();
+      c2.globalCompositeOperation = "source-over";
+    }
+    // the brush's outline, following the pointer
+    function showBrush(e) {
+      const el = brushRef.current;
+      if (!el) return;
+      if (tool === "click" || !e) { el.style.display = "none"; return; }
+      const r = viewRef.current.getBoundingClientRect();
+      const box = el.parentElement.getBoundingClientRect();
+      const d = (2 * brush * r.width) / w;
+      Object.assign(el.style, {
+        display: "block", width: d + "px", height: d + "px",
+        left: e.clientX - box.left - d / 2 + "px", top: e.clientY - box.top - d / 2 + "px",
+        borderColor: tool === "add" ? "#7fc4ff" : "#ff7a7a",
+      });
+    }
+    React.useEffect(() => { if (tool === "click") showBrush(null); }, [tool]);
+    function onPointerDown(e) {
+      e.preventDefault();
+      const [x, y] = imagePoint(e);
+      if (tool === "click") {
+        const exclude = e.altKey || e.button === 2;
+        setPoints((p) => [...p, [Math.round(x), Math.round(y), exclude ? 0 : 1]]);
+        return;
+      }
+      const el = e.currentTarget;
+      try { el.setPointerCapture(e.pointerId); } catch (err2) { /* pointer already gone */ }
+      paint(x, y);
+      redraw();
+      const move = (ev) => { const [mx, my] = imagePoint(ev); paint(mx, my); showBrush(ev); redraw(); };
+      const up = () => { el.removeEventListener("pointermove", move); el.removeEventListener("pointerup", up); };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+    }
+    function clear() {
+      const b = bufs.current;
+      b.add.getContext("2d").clearRect(0, 0, w, hh);
+      b.erase.getContext("2d").clearRect(0, 0, w, hh);
+      setPoints([]);
+      redraw();
+    }
+    async function save() {
+      const a = final().cut.getContext("2d").getImageData(0, 0, w, hh).data;
+      let any = false;
+      for (let i = 3; i < a.length && !any; i += 16) any = a[i] > 127;
+      if (!any) return setErr("Nothing is selected yet: click on the element first.");
+      setSaving(true);
+      try {
+        const res = await api("mask", { source_key: project.source_key, png: compose().toDataURL("image/png") });
+        onSave({ name: name.trim() || "Element", mask: res.file, edge, from: from || undefined });
+      } catch (e) {
+        setErr(e.message);
+        setSaving(false);
+      }
+    }
+    React.useEffect(() => {
+      const onKey = (e) => {
+        if (e.target.matches && e.target.matches("input, select, textarea")) return;
+        if (e.key === "Escape") onCancel();
+        else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) { e.preventDefault(); setPoints((p) => p.slice(0, -1)); }
+        else if (e.key === "Enter") save();
+        else if (e.key === "v" || e.key === "V") setShow((s) => (s === "result" ? "select" : "result"));
+        else if (e.key === "[") smaller();
+        else if (e.key === "]") larger();
+        else return;
+        e.stopPropagation();
+      };
+      window.addEventListener("keydown", onKey, true);
+      return () => window.removeEventListener("keydown", onKey, true);
+    });
+
+    const toolButton = (id, label, title) =>
+      h("button", { className: "pxs-button" + (tool === id ? " pxs-primary" : ""), onClick: () => setTool(id), title }, label);
+    return h("div", { className: "pxs-cutter" },
+      h("div", { className: "pxs-cutter-bar" },
+        h("input", { className: "pxs-cutter-name", value: name, onChange: (e) => setName(e.target.value), title: "The layer's name" }),
+        h("label", { className: "pxs-cutter-size", title: "What the element is cut out of: it keeps to that, and is taken out of it" }, "From",
+          h("select", { value: from || "", onChange: (e) => setFrom(e.target.value || null) },
+            h("option", { value: "" }, "Person"),
+            sources.map((l) => h("option", { key: l.id, value: l.id }, l.name || "Element")))),
+        toolButton("click", "✚ Click to select", "Click: part of the element. Alt-click or right-click: not part of it."),
+        toolButton("add", "● Brush", "Paint to add to the selection"),
+        toolButton("erase", "○ Eraser", "Paint to take away from the selection"),
+        tool !== "click" && h("label", { className: "pxs-cutter-size" }, "Size",
+          h("input", { type: "range", min: 2, max: Math.round(Math.max(w, hh) / 8), value: brush, onChange: (e) => setBrush(Number(e.target.value)) })),
+        options.length > 1 && h("span", { className: "pxs-cutter-sizes" },
+          h("button", { className: "pxs-button", disabled: pick === 0, onClick: smaller, title: "A smaller guess for this click ([)" }, "\u25C2 Smaller"),
+          h("span", { className: "pxs-muted pxs-small" }, `${pick + 1} of ${options.length}`),
+          h("button", { className: "pxs-button", disabled: pick === options.length - 1, onClick: larger, title: "A larger guess for this click (])" }, "Larger \u25B8")),
+        h("button", { className: "pxs-button", disabled: !points.length, onClick: () => setPoints((p) => p.slice(0, -1)), title: "Undo the last click (Ctrl+Z)" }, "Undo click"),
+        h("button", { className: "pxs-button", onClick: clear }, "Clear"),
+        h("span", { className: "pxs-spacer" }),
+        busy && h("span", { className: "pxs-muted pxs-small" }, points.length === 1 ? "Looking at the photo…" : "Selecting…"),
+        h("button", { className: "pxs-button", onClick: onCancel, title: "Esc" }, "Cancel"),
+        h("button", { className: "pxs-button pxs-primary", disabled: busy || saving, onClick: save, title: "Enter" },
+          saving ? "Saving…" : layer ? "Save cut-out" : "Create layer")),
+      h("div", { className: "pxs-cutter-bar pxs-cutter-edge" },
+        h(EdgeControls, { edge, max: maxEdge, sourceName: fromLayer ? fromLayer.name || "Element" : "the person", onChange: (patch) => setEdge((e) => ({ ...e, ...patch })) }),
+        h("span", { className: "pxs-spacer" }),
+        h("span", { className: "pxs-muted pxs-small" }, "View"),
+        h("button", { className: "pxs-button" + (show === "select" ? " pxs-primary" : ""), onClick: () => setShow("select"), title: "The selection over the photo" }, "Selection"),
+        h("button", { className: "pxs-button" + (show === "result" ? " pxs-primary" : ""), onClick: () => setShow("result"), title: "The layer as it will be, on a checkerboard (V)" }, "Result")),
+      h("div", { className: "pxs-cutter-body" },
+        h("canvas", {
+          ref: viewRef, className: "pxs-cutter-view" + (tool === "click" ? "" : " brush"),
+          onPointerDown, onContextMenu: (e) => e.preventDefault(),
+          onPointerMove: (e) => { if (!e.buttons) showBrush(e); }, onPointerLeave: () => showBrush(null),
+        }),
+        h("div", { className: "pxs-brush", ref: brushRef })),
+      h("div", { className: "pxs-cutter-hint" },
+        err ? h("span", { className: "pxs-danger" }, err)
+          : "Click the element to cut out of the person (an arm, a phone, hair…); Smaller / Larger picks between the guesses for one click. " +
+            "Click more of it to add, Alt- or right-click what isn't part of it. " +
+            "Tidy the edge with the brush and eraser. It's taken out of the person layer onto a layer of its own."));
+  }
+
+  // Margin / Soften / Keep to the person, for the cutter and the layer inspector
+  function EdgeControls({ edge, max, onChange, sourceName = "the person" }) {
+    const range = (key, label, title) =>
+      h("label", { className: "pxs-cutter-size", title }, `${label} ${edge[key]} px`,
+        h("input", { type: "range", min: 0, max, step: 1, value: Math.min(max, edge[key]), onChange: (e) => onChange({ [key]: Number(e.target.value) }) }));
+    return h(React.Fragment, null,
+      h("span", { className: "pxs-muted pxs-small" }, "Edge"),
+      range("margin", "Margin", "Cut this far around the element, into what surrounds it"),
+      range("soften", "Feather", "Fade the layer out beyond its edge, to fully transparent over this distance (the element itself stays solid)"),
+      h("label", { className: "pxs-check", title: `On: only ${sourceName}'s pixels. Off: the photo's, so a margin takes in the surroundings too` },
+        h("input", { type: "checkbox", checked: edge.person, onChange: (e) => onChange({ person: e.target.checked }) }), ` Keep to ${sourceName}`));
+  }
+
+  function LayerInspector({ layer, time, fps, kfAt, onParam, onToggleKey, setTime, onRename, onEditMask, onRemove, onAddKf, onDeleteKf, bullet, onEdge, maxEdge, sourceName }) {
+    const L = R().LAYER_PARAMS;
+    const v = R().layerAt(layer, time);
+    return h("div", null,
+      h("h5", null, "Element layer"),
+      h("label", { className: "pxs-field" }, h("span", null, "Name"),
+        h("input", { value: layer.name || "", onChange: (e) => onRename(e.target.value) })),
+      bullet ? h("p", { className: "pxs-warning" }, "Element layers aren't shown on bullet-time projects.") : null,
+      h("div", { className: "pxs-row" },
+        kfAt ? h("button", { className: "pxs-button", onClick: onDeleteKf }, "Delete keyframe")
+          : h("button", { className: "pxs-button", onClick: onAddKf }, "Add keyframe (K)")),
+      h("p", { className: "pxs-muted pxs-small" }, "Depth 0 = with the person, 1 = at the background, negative = in front of the person. Rotate X / Y / Z turn it around its centre in 3D. " +
+        "Position and size are on top of the person's own. Changing a value keys it at the playhead."),
+      R().LAYER_KEYS.map((k) => {
+        const ki = keyInfo(layer.keyframes, k, time, fps);
+        return h(ParamRow, {
+          key: k, label: L[k].label, value: v[k], def: L[k], onChange: (x) => onParam(k, x),
+          keyed: ki.keyed, animated: ki.animated, onToggleKey: () => onToggleKey(k),
+          onPrev: ki.prev != null ? () => setTime(ki.prev) : null, onNext: ki.next != null ? () => setTime(ki.next) : null,
+        });
+      }),
+      h("p", { className: "pxs-muted pxs-small" }, `Cut from ${sourceName}.`),
+      h("div", { className: "pxs-layer-edge" }, h(EdgeControls, { edge: edgeOf(layer), max: maxEdge, sourceName, onChange: onEdge })),
+      h("div", { className: "pxs-row" },
+        h("button", { className: "pxs-button", onClick: onEditMask }, "Change cut-out"),
+        h("button", { className: "pxs-link pxs-danger", onClick: onRemove }, "Delete layer")));
+  }
+
   // A caption's effects: each with its options and a remove button, plus "Add effect".
   function CaptionEffects({ cap, update }) {
     const FX = R().CAPTION_EFFECTS;
@@ -474,7 +1001,7 @@
     );
   }
 
-  function CaptionInspector({ cap, update, remove, length, time, kfAt, onParam, onAddKf, onDeleteKf, onEase, onToggleKey, setTime, fps }) {
+  function CaptionInspector({ cap, update, remove, length, time, kfAt, onParam, onAddKf, onDeleteKf, onEase, onToggleKey, setTime, fps, viewCap, pending }) {
     const S = window.SlideshowCaptions || {};
     const fonts = R().fonts();
     const field = (label, el) => h("label", { className: "pxs-field" }, h("span", null, label), el);
@@ -527,7 +1054,8 @@
               const def = R().CAPTION_PARAMS[k];
               const ki = keyInfo(cap.keyframes, k, time, fps, cap.start);
               return h(ParamRow, {
-                key: k, label: def.label, value: R().captionAt(cap, time)[k], def, onChange: (v) => onParam(k, v),
+                key: k, label: def.label, value: R().captionAt(viewCap || cap, time)[k], def, onChange: (v) => onParam(k, v),
+                pending: pending && pending[k] != null,
                 keyed: ki.keyed, animated: ki.animated, onToggleKey: () => onToggleKey(k),
                 onPrev: ki.prev != null ? () => setTime(ki.prev) : null, onNext: ki.next != null ? () => setTime(ki.next) : null,
               });
@@ -1027,6 +1555,38 @@
             write: (kfs) => change((p) => ({ ...p, captions: p.captions.map((x) => (x.id === c.id ? { ...x, keyframes: kfs } : x)) })),
           }))),
       project.captions.length === 0 && track("Captions", null, " pxs-empty"),
+      (project.layers || []).map((l) =>
+        h(React.Fragment, { key: l.id },
+          track(expander("layer:" + l.id, l.name || "Element", "Element layer"),
+            h(React.Fragment, null,
+              h("div", {
+                className: "pxs-clip pxs-clip-layer" + (selection?.layer === l.id ? " active" : ""), style: { left: 0, width: "100%" },
+                onPointerDown: (e) => { setSelection({ type: "layer", layer: l.id }); scrub(e); },
+              }, h("span", null, l.name || "Element")),
+              (l.keyframes || []).filter((k) => R().LAYER_KEYS.some((x) => k[x] != null)).map((k) =>
+                h("span", {
+                  key: k.id,
+                  className: "pxs-kf" + (selection?.lkf === k.id && !selection?.lkey ? " active" : ""),
+                  style: { left: pct(k.t) },
+                  title: `${fmtTime(k.t)} · ${k.ease}`,
+                  onPointerDown: (e) => {
+                    setSelection({ type: "layer", layer: l.id, lkf: k.id });
+                    setPlaying(false);
+                    setTime(k.t);
+                    const t0 = k.t;
+                    drag(e, (ev, dx) => {
+                      const t = snap(t0 + dx / secPx());
+                      change((p) => ({ ...p, layers: p.layers.map((x) => (x.id !== l.id ? x : { ...x, keyframes: x.keyframes.map((y) => (y.id === k.id ? { ...y, t } : y)) })) }));
+                      setTime(t);
+                    });
+                  },
+                })))),
+          expanded["layer:" + l.id] && valueLanes({
+            keys: R().LAYER_KEYS, params: R().LAYER_PARAMS, kfs: l.keyframes || [], start: 0, span: L,
+            active: (k, key) => selection?.lkf === k.id && selection?.lkey === key,
+            select: (id, key) => setSelection({ type: "layer", layer: l.id, lkf: id, lkey: key }),
+            write: (kfs) => change((p) => ({ ...p, layers: p.layers.map((x) => (x.id === l.id ? { ...x, keyframes: kfs } : x)) })),
+          }))),
       track("Person", h("div", { className: "pxs-clip pxs-clip-person", style: { left: 0, width: "100%" } }, h("span", null, cutLabel))),
       track("Background", h("div", { className: "pxs-clip pxs-clip-bg", style: { left: 0, width: "100%" } }, h("span", null, cutLabel))))
     );
@@ -1061,6 +1621,12 @@
     const [pending, setPending] = React.useState(null);
     const pendingRef = React.useRef(null);
     pendingRef.current = pending;
+    // the same for captions dragged on the preview: {caption id: {x, y}}
+    const [capPending, setCapPending] = React.useState(null);
+    const capPendingRef = React.useRef(null);
+    capPendingRef.current = capPending;
+    const anyPending = !!(pending || capPending);
+    const discardPending = () => { setPending(null); setCapPending(null); };
     projectRef.current = project;
     const dirty = React.useRef(false);
     const exportState = React.useRef(null); // the running export, so Cancel can stop it
@@ -1145,6 +1711,67 @@
       })().catch((e) => setError(e.message));
       return () => (alive = false);
     }, [cut && cut.id, bgFile]);
+
+    // element layers: each one's pixels (the person through its mask), its centre, and
+    // the person with them all taken out
+    const layerSig = project ? (project.layers || []).map((l) => l.id + ":" + l.mask + ":" + (l.from || "") + ":" + JSON.stringify(edgeOf(l))).join("|") : "";
+    React.useEffect(() => {
+      const fg = images.fg;
+      if (!fg) return;
+      const layers = (projectRef.current && projectRef.current.layers) || [];
+      if (!layers.length || images.fgSeq) {
+        if (images.fgCut || images.layers) setImages((im) => ({ ...im, fgCut: null, layers: null }));
+        return;
+      }
+      let alive = true;
+      (async () => {
+        const w = fg.naturalWidth;
+        const hh = fg.naturalHeight;
+        const person = newCanvas(w, hh);
+        const pc = person.getContext("2d");
+        pc.drawImage(fg, 0, 0);
+        pc.globalCompositeOperation = "destination-out";
+        const out = {};
+        // layers that take in their surroundings take their pixels from the photo
+        let photo = null;
+        if (urls.source && layers.some((l) => !edgeOf(l).person)) photo = await loadImage(urls.source).catch(() => null);
+        // sources first: a layer cut from another takes its pixels out of that one
+        for (const l of sourceOrder(layers)) {
+          const src = l.from && out[l.from];
+          let img;
+          try {
+            img = await loadImage(await fileUrl(l.mask));
+          } catch (e) {
+            continue; // a missing mask: that layer just isn't drawn
+          }
+          const from = src ? src.canvas : fg;
+          const { cut: mask, alpha } = maskShapes(drawMaskAlpha(newCanvas(w, hh), img), from, l.edge);
+          const c = newCanvas(w, hh);
+          const cc = c.getContext("2d");
+          if (!edgeOf(l).person && photo) cc.drawImage(photo, 0, 0, w, hh);
+          else cc.drawImage(from, 0, 0);
+          cc.globalCompositeOperation = "destination-in";
+          cc.drawImage(alpha, 0, 0);
+          // what it takes out (solid: no ghost of it stays behind)
+          pc.drawImage(mask, 0, 0);
+          if (src) {
+            const sc = src.canvas.getContext("2d");
+            sc.globalCompositeOperation = "destination-out";
+            sc.drawImage(mask, 0, 0);
+            sc.globalCompositeOperation = "source-over";
+          }
+          // full: its pixels before anything is cut from it (to cut from it again)
+          const full = newCanvas(w, hh);
+          full.getContext("2d").drawImage(c, 0, 0);
+          out[l.id] = { canvas: c, full, centre: maskCentre(mask) };
+        }
+        if (alive) setImages((im) => ({ ...im, fgCut: person, layers: out }));
+      })().catch((e) => setError(e.message));
+      return () => (alive = false);
+    }, [images.fg, layerSig, urls.source]);
+    const [cutter, setCutter] = React.useState(null); // {layer: the layer being changed, or null for a new one}
+    const cutterRef = React.useRef(null);
+    cutterRef.current = cutter;
 
     // cuts made before backgrounds were extended get their border now
     const [extending, setExtending] = React.useState(null);
@@ -1245,6 +1872,26 @@
 
     // the selected caption or keyframe, or the keyframe at the playhead
     function deleteSelected() {
+      const sl = selection.layer && (projectRef.current.layers || []).find((l) => l.id === selection.layer);
+      if (sl) {
+        const at = selection.lkf && sl.keyframes.find((k) => k.id === selection.lkf);
+        if (at && selection.lkey) {
+          // a value lane's diamond: just that value's key
+          updateLayer(sl.id, (l) => ({
+            ...l,
+            keyframes: l.keyframes.flatMap((x) => {
+              if (x.id !== at.id) return [x];
+              const { [selection.lkey]: gone, ...rest } = x;
+              return Object.keys(rest).some((y) => !KF_META.includes(y)) ? [rest] : [];
+            }),
+          }));
+          setSelection({ type: "layer", layer: sl.id });
+        } else if (at) {
+          updateLayer(sl.id, (l) => ({ ...l, keyframes: l.keyframes.filter((x) => x.id !== at.id) }));
+          setSelection({ type: "layer", layer: sl.id });
+        } else removeLayer(sl.id);
+        return;
+      }
       const sc = selection.caption && projectRef.current.captions.find((c) => c.id === selection.caption);
       if (sc && selection.ckf && selection.ckey && (sc.keyframes || []).some((k) => k.id === selection.ckf)) {
         // a value lane's diamond: just that value's key
@@ -1324,9 +1971,9 @@
       }
       const ctx = canvas.getContext("2d");
       ctx.setTransform(cw / W, 0, 0, ch / H, 0, 0);
-      const p = playing ? projectRef.current : withPending(projectRef.current, t, pendingRef.current);
+      const p = playing ? projectRef.current : withPending(projectRef.current, t, pendingRef.current, capPendingRef.current);
       R().drawFrame(ctx, p, images, t, W, H, cover);
-    }, [box, images, cover, W, H, playing, pending]);
+    }, [box, images, cover, W, H, playing, pending, capPending]);
 
     React.useEffect(() => draw(time), [draw, time, project, fontsReady]);
 
@@ -1436,6 +2083,13 @@
     }
     function setCapParam(id, key, value) {
       setPlaying(false);
+      setCapPending((cp) => {
+        if (!cp || !cp[id] || cp[id][key] == null) return cp;
+        const { [key]: gone, ...rest } = cp[id];
+        const { [id]: was, ...others } = cp;
+        const next = Object.keys(rest).length ? { ...others, [id]: rest } : others;
+        return Object.keys(next).length ? next : null;
+      });
       updateCap(id, (c) => {
         if (time < c.start || time > c.end) return c;
         const at = (c.keyframes || []).find((k) => Math.abs(c.start + k.t - time) < 0.5 / fps);
@@ -1457,6 +2111,59 @@
     function deleteCapKf(id, kid) {
       updateCap(id, (c) => ({ ...c, keyframes: c.keyframes.filter((k) => k.id !== kid) }));
       setSelection({ type: "caption", caption: id });
+    }
+
+    // element layers' keyframes (times absolute)
+    const layerKfAt = (l) => l && (l.keyframes || []).find((k) => Math.abs(k.t - time) < 0.5 / fps);
+    function updateLayer(id, fn) {
+      change((p) => ({ ...p, layers: (p.layers || []).map((l) => (l.id === id ? fn(l) : l)) }));
+    }
+    function setLayerParam(id, key, value) {
+      setPlaying(false);
+      updateLayer(id, (l) => {
+        const at = layerKfAt(l);
+        if (at) return { ...l, keyframes: l.keyframes.map((k) => (k === at ? { ...k, [key]: value } : k)) };
+        const kf = { id: newId(), t: Math.round(time * fps) / fps, [key]: value, ease: "inout" };
+        setSelection({ type: "layer", layer: id, lkf: kf.id });
+        return { ...l, keyframes: [...(l.keyframes || []), kf] };
+      });
+    }
+    function toggleLayerKey(l, key) {
+      const at = layerKfAt(l);
+      if (!at || at[key] == null) return setLayerParam(l.id, key, R().layerAt(l, time)[key]);
+      updateLayer(l.id, (x) => ({
+        ...x,
+        keyframes: x.keyframes.flatMap((k) => {
+          if (k.id !== at.id) return [k];
+          const { [key]: gone, ...rest } = k;
+          return Object.keys(rest).some((y) => !KF_META.includes(y)) ? [rest] : [];
+        }),
+      }));
+    }
+    function addLayerKf(l) {
+      const at = layerKfAt(l);
+      if (at) return setSelection({ type: "layer", layer: l.id, lkf: at.id });
+      const kf = { id: newId(), t: Math.round(time * fps) / fps, ...keyedNow(l.keyframes, R().LAYER_PARAMS, R().LAYER_KEYS, (t) => R().layerAt(l, t), time), ease: "inout" };
+      setSelection({ type: "layer", layer: l.id, lkf: kf.id });
+      updateLayer(l.id, (x) => ({ ...x, keyframes: [...(x.keyframes || []), kf] }));
+    }
+    function removeLayer(id) {
+      // what was cut from it goes back to being cut from its source
+      change((p) => {
+        const gone = (p.layers || []).find((l) => l.id === id);
+        return { ...p, layers: (p.layers || []).filter((l) => l.id !== id).map((l) => (l.from === id ? { ...l, from: gone && gone.from } : l)) };
+      });
+      setSelection({ type: "camera" });
+    }
+    function saveCutout({ name, mask, edge, from }) {
+      const editing = cutterRef.current && cutterRef.current.layer;
+      if (editing) updateLayer(editing.id, (l) => ({ ...l, name, mask, edge, from }));
+      else {
+        const l = { id: newId(), name, mask, edge, from, keyframes: [] };
+        change((p) => ({ ...p, layers: [...(p.layers || []), l] }));
+        setSelection({ type: "layer", layer: l.id });
+      }
+      setCutter(null);
     }
 
     function removeCaption(id) {
@@ -1490,7 +2197,46 @@
     };
     function keyChanges() {
       if (pendingRef.current) setParams(pendingRef.current);
-      setPending(null);
+      Object.entries(capPendingRef.current || {}).forEach(([id, values]) =>
+        Object.entries(values).forEach(([k, v]) => setCapParam(id, k, v)));
+      discardPending();
+    }
+    function setCapView(id, values) {
+      setPlaying(false);
+      setCapPending((cp) => ({ ...(cp || {}), [id]: { ...((cp || {})[id] || {}), ...values } }));
+    }
+    const viewProject = () => withPending(projectRef.current, time, pendingRef.current, capPendingRef.current);
+    // a caption under the pointer: dragging it moves it on its own plane (a view change too)
+    function captionPointerDown(e, hit) {
+      const el = e.currentTarget;
+      const id = hit.cap.id;
+      setSelection({ type: "caption", caption: id });
+      const v0 = R().captionAt(hit.cap, time);
+      const C = R().CAPTION_PARAMS;
+      const clamp = (k, v) => Math.max(C[k].min, Math.min(C[k].max, v));
+      const start = { x: e.clientX, y: e.clientY };
+      let moved = false;
+      const move = (ev) => {
+        if (!moved && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) < 4) return;
+        moved = true;
+        const pt = previewPoint(ev);
+        const p = viewProject();
+        const cap = p.captions.find((c) => c.id === id);
+        const q = cap && R().captionFlatPoint(p, images, cap, time, W, H, cover, pt.x, pt.y);
+        if (q) setCapView(id, { x: clamp("x", v0.x + (q.x - hit.point.x) / W), y: clamp("y", v0.y + (q.y - hit.point.y) / H) });
+      };
+      const up = () => {
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", up);
+      };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+    }
+    function previewHover(e) {
+      if (e.buttons || !projectRef.current || playing) return;
+      const pt = previewPoint(e);
+      const hit = R().pickCaption(viewProject(), images, time, W, H, cover, pt.x, pt.y);
+      e.currentTarget.style.cursor = hit ? "move" : "";
     }
     // drag the orbit point's cross: it follows the pointer at its current depth
     function orbitPointerDown(e) {
@@ -1522,6 +2268,9 @@
       const el = e.currentTarget;
       try { el.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
       setPlaying(false);
+      const pt0 = previewPoint(e);
+      const hit = !e.shiftKey && R().pickCaption(viewProject(), images, time, W, H, cover, pt0.x, pt0.y);
+      if (hit) return captionPointerDown(e, hit);
       const start = { x: e.clientX, y: e.clientY };
       const cam0 = viewCam();
       const P = R().PARAMS;
@@ -1572,21 +2321,78 @@
       }
     }
 
+    // the selected caption's box with scale (corners) and rotate (top) handles, in CSS
+    // pixels over the stage
+    const toCss = (pt) => ({ x: (box.sw - box.w) / 2 + (pt.x / W) * box.w + box.w / 2, y: (box.sh - box.h) / 2 + (pt.y / H) * box.h + box.h / 2 });
+    let capFrame = null;
+    if (project && !playing && !exporting && selection.caption && box.sw) {
+      const vp = withPending(project, time, pending, capPending);
+      const cap = vp.captions.find((c) => c.id === selection.caption);
+      const f = cap && R().captionFrame(vp, images, cap, time, W, H, cover);
+      if (f) capFrame = { id: cap.id, corners: f.corners.map(toCss), top: toCss(f.top), rotate: toCss(f.rotate), centre: toCss(f.centre) };
+    }
+    // dragging a handle: scale by the pointer's distance from the caption's centre, or
+    // rotate by its angle around it, both on the caption's own plane (view changes)
+    function handlePointerDown(e, kind) {
+      e.preventDefault();
+      e.stopPropagation();
+      const el = e.currentTarget;
+      try { el.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
+      setPlaying(false);
+      const id = selection.caption;
+      const flatOf = (ev) => {
+        const p = viewProject();
+        const cap = p.captions.find((c) => c.id === id);
+        const pt = previewPoint(ev);
+        return cap && R().captionFlatPoint(p, images, cap, time, W, H, cover, pt.x, pt.y);
+      };
+      const p0 = viewProject();
+      const cap0 = p0.captions.find((c) => c.id === id);
+      const L = cap0 && R().captionLayout(document.createElement("canvas").getContext("2d"), cap0, time, W, H);
+      const q0 = flatOf(e);
+      if (!L || !q0) return;
+      const v0 = R().captionAt(cap0, time);
+      const C = R().CAPTION_PARAMS;
+      const d0 = Math.max(1, Math.hypot(q0.x - L.cx, q0.y - L.cy));
+      const a0 = Math.atan2(q0.y - L.cy, q0.x - L.cx);
+      const move = (ev) => {
+        const q = flatOf(ev);
+        if (!q) return;
+        if (kind === "scale") {
+          const s = (v0.scale * Math.hypot(q.x - L.cx, q.y - L.cy)) / d0;
+          setCapView(id, { scale: Math.max(C.scale.min, Math.min(C.scale.max, Math.round(s * 100) / 100)) });
+        } else {
+          let r = v0.rotate + ((Math.atan2(q.y - L.cy, q.x - L.cx) - a0) * 180) / Math.PI;
+          r = ((r + 540) % 360) - 180;
+          if (ev.shiftKey) r = Math.round(r / 15) * 15; // Shift: 15° steps
+          setCapView(id, { rotate: Math.round(r * 2) / 2 });
+        }
+      };
+      const up = () => {
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", up);
+      };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+    }
+
     // keyboard
     React.useEffect(() => {
       function onKey(e) {
-        if (!projectRef.current || exporting) return;
+        if (!projectRef.current || exporting || cutterRef.current) return;
         if (e.target.matches && e.target.matches("input, select, textarea")) return;
         const step = 1 / projectRef.current.fps;
         const mod = e.ctrlKey || e.metaKey;
         if (mod && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undo(e.shiftKey); }
         else if (mod && (e.key === "y" || e.key === "Y")) { e.preventDefault(); undo(true); }
         else if (e.key === " ") { e.preventDefault(); setPlaying((p) => !p); }
-        else if ((e.key === "k" || e.key === "K") && pendingRef.current) keyChanges();
-        else if (e.key === "Escape" && pendingRef.current) setPending(null);
+        else if ((e.key === "k" || e.key === "K") && (pendingRef.current || capPendingRef.current)) keyChanges();
+        else if (e.key === "Escape" && (pendingRef.current || capPendingRef.current)) discardPending();
         else if (e.key === "k" || e.key === "K") {
           const sc = selection.caption && projectRef.current.captions.find((c) => c.id === selection.caption);
+          const sl = selection.layer && (projectRef.current.layers || []).find((l) => l.id === selection.layer);
           if (sc && time >= sc.start && time <= sc.end) addCapKf(sc.id);
+          else if (sl) addLayerKf(sl);
           else addKf();
         }
         else if (e.key === "ArrowRight") { setPlaying(false); setTime((t) => Math.min(projectRef.current.length, t + step)); }
@@ -1675,6 +2481,7 @@
     if (!project) return h("div", { className: "pxs-list" }, "Loading…");
 
     const selCaption = selection.caption && project.captions.find((c) => c.id === selection.caption);
+    const selLayer = selection.layer && (project.layers || []).find((l) => l.id === selection.layer);
     const cutLabel = cut ? `${cut.meta.model === "general" ? "Anything" : "People"} cut · ${cut.meta.fill}` : "no layers yet";
     const generating = !cut;
 
@@ -1699,9 +2506,9 @@
         h("button", { className: "pxs-button", disabled: !redoStack.current.length, onClick: () => undo(true), title: "Redo (Ctrl+Shift+Z)" }, "\u21B7 Redo"),
         h("button", {
           className: "pxs-button",
-          disabled: !(selCaption || kfAt || (selection.kf && project.keyframes.some((k) => k.id === selection.kf))),
+          disabled: !(selCaption || selLayer || kfAt || (selection.kf && project.keyframes.some((k) => k.id === selection.kf))),
           onClick: deleteSelected,
-          title: "Delete the selected caption or keyframe (Delete)",
+          title: "Delete the selected caption, layer or keyframe (Delete)",
         }, "Delete"),
         h("button", {
           className: "pxs-button" + (confirmReset ? " pxs-warn" : ""),
@@ -1711,7 +2518,8 @@
             if (!confirmReset) return setConfirmReset(true);
             setConfirmReset(false);
             change((p) => ({
-              ...p, length: 6, size: "1080p", fps: 30, keyframes: defaultKeyframes(6, !!(p.source && p.source.span)), captions: [], smooth: {}, boomerang: false, _centre: true,
+              ...p, length: 6, size: "1080p", fps: 30, keyframes: defaultKeyframes(6, !!(p.source && p.source.span)), captions: [], smooth: {},
+              layers: (p.layers || []).map((l) => ({ ...l, keyframes: [] })), boomerang: false, _centre: true,
             }));
             setSelection({ type: "camera" });
             setPlaying(false);
@@ -1746,19 +2554,45 @@
           onBlur: () => setConfirmDelete(false),
         }, confirmDelete ? "Click again to delete project" : "Delete project")
       ),
-      h(MediaBin, { project, cuts, cut, urls, status, job, onUseCut: useCut, onRecut: recut }),
+      h(MediaBin, {
+        project, cuts, cut, urls, status, job, onUseCut: useCut, onRecut: recut,
+        onCutElement: () => { setPlaying(false); setCutter({ layer: null, from: selection.layer || null }); },
+        onSelectLayer: (id) => setSelection({ type: "layer", layer: id }), selectedLayer: selection.layer,
+      }),
       h(
         "div",
         { className: "pxs-stage", ref: stageRef },
+        cutter && cut && images.fg && h(ElementCutter, {
+          project, cut, images, source: urls.source, layer: cutter.layer, from: cutter.layer ? cutter.layer.from : cutter.from,
+          onSave: saveCutout, onCancel: () => setCutter(null),
+        }),
         h("canvas", {
           ref: canvasRef, style: { width: box.w, height: box.h },
-          className: "pxs-canvas", onPointerDown: previewPointerDown, onWheel: previewWheel,
-          title: "Click: set the orbit point. Drag: orbit. Shift+drag: slide. Wheel: dolly. Then Key changes (K) keys them.",
+          className: "pxs-canvas", onPointerDown: previewPointerDown, onPointerMove: previewHover, onWheel: previewWheel,
+          title: "Click: set the orbit point. Drag: orbit (or move a caption). Shift+drag: slide. Wheel: dolly. Then Key changes (K) keys them.",
         }),
-        pending && !playing && h("div", { className: "pxs-pending-bar" },
-          h("span", null, "View changed (not keyed): ", Object.keys(pending).map((k) => R().PARAMS[k].label).join(", ")),
+        anyPending && !playing && h("div", { className: "pxs-pending-bar" },
+          h("span", null, "Changed (not keyed): ", [
+            ...Object.keys(pending || {}).map((k) => R().PARAMS[k].label),
+            ...Object.entries(capPending || {}).map(([id, v]) => {
+              const c = project.captions.find((x) => x.id === id);
+              return `“${(c && c.text) || "Caption"}” ${Object.keys(v).map((k) => R().CAPTION_PARAMS[k].label).join(", ")}`;
+            }),
+          ].join(", ")),
           h("button", { className: "pxs-button pxs-primary", onClick: keyChanges, title: "Key these values at the playhead (K)" }, "\u25C6 Key changes"),
-          h("button", { className: "pxs-button", onClick: () => setPending(null), title: "Back to the keyed view (Esc)" }, "Discard")),
+          h("button", { className: "pxs-button", onClick: discardPending, title: "Back to the keyed view (Esc)" }, "Discard")),
+        capFrame && h("svg", { className: "pxs-cap-frame", width: box.sw, height: box.sh },
+          h("polygon", { points: capFrame.corners.map((p) => `${p.x},${p.y}`).join(" ") }),
+          h("line", { x1: capFrame.top.x, y1: capFrame.top.y, x2: capFrame.rotate.x, y2: capFrame.rotate.y }),
+          capFrame.corners.map((p, i) => h("rect", {
+            key: i, className: "pxs-cap-handle", x: p.x - 5, y: p.y - 5, width: 10, height: 10,
+            style: { cursor: i % 2 ? "nesw-resize" : "nwse-resize" },
+            onPointerDown: (e) => handlePointerDown(e, "scale"),
+          }, h("title", null, "Drag to scale"))),
+          h("circle", {
+            className: "pxs-cap-handle", cx: capFrame.rotate.x, cy: capFrame.rotate.y, r: 6, style: { cursor: "grab" },
+            onPointerDown: (e) => handlePointerDown(e, "rotate"),
+          }, h("title", null, "Drag to rotate (Shift: 15° steps)"))),
         orbitMarker && h("div", {
           className: "pxs-orbit", style: { left: orbitMarker.left, top: orbitMarker.top },
           onPointerDown: orbitPointerDown, title: "Drag to move the orbit point",
@@ -1783,12 +2617,16 @@
           ? h(CaptionInspector, {
               cap: selCaption, length: project.length, time, kfAt: capKfAt(selCaption),
               update: (patch) => updateCaption(selCaption.id, patch),
+              pending: capPending && capPending[selCaption.id],
+              viewCap: capPending && capPending[selCaption.id]
+                ? withPending(project, time, null, capPending).captions.find((c) => c.id === selCaption.id) : null,
               remove: () => removeCaption(selCaption.id),
               onParam: (k, v) => setCapParam(selCaption.id, k, v),
               fps, setTime: (t) => { setPlaying(false); setTime(t); },
               onToggleKey: (k) => {
                 const at = capKfAt(selCaption);
-                if (!at || at[k] == null) return setCapParam(selCaption.id, k, R().captionAt(selCaption, time)[k]);
+                const held = capPending && capPending[selCaption.id] && capPending[selCaption.id][k];
+                if (!at || at[k] == null) return setCapParam(selCaption.id, k, held != null ? held : R().captionAt(selCaption, time)[k]);
                 updateCap(selCaption.id, (c) => ({
                   ...c,
                   keyframes: c.keyframes.flatMap((x) => {
@@ -1802,6 +2640,20 @@
               onDeleteKf: () => { const k = capKfAt(selCaption); if (k) deleteCapKf(selCaption.id, k.id); },
               onEase: (ease) => { const at = capKfAt(selCaption); updateCap(selCaption.id, (c) => ({ ...c, keyframes: c.keyframes.map((k) => (k.id === at.id ? withEase(k, ease) : k)) })); },
             })
+          : selLayer ? h(LayerInspector, {
+              layer: selLayer, time, fps, kfAt: layerKfAt(selLayer), bullet: !!images.fgSeq,
+              onParam: (k, v) => setLayerParam(selLayer.id, k, v),
+              onToggleKey: (k) => toggleLayerKey(selLayer, k),
+              setTime: (t) => { setPlaying(false); setTime(t); },
+              onRename: (name) => updateLayer(selLayer.id, (l) => ({ ...l, name })),
+              onEdge: (patch) => updateLayer(selLayer.id, (l) => ({ ...l, edge: { ...edgeOf(l), ...patch } })),
+              maxEdge: images.fg ? Math.round(Math.max(images.fg.naturalWidth, images.fg.naturalHeight) / 10) : 100,
+              sourceName: (() => { const s = selLayer.from && project.layers.find((l) => l.id === selLayer.from); return s ? s.name || "Element" : "the person"; })(),
+              onEditMask: () => { setPlaying(false); setCutter({ layer: selLayer }); },
+              onRemove: () => removeLayer(selLayer.id),
+              onAddKf: () => addLayerKf(selLayer),
+              onDeleteKf: () => { const k = layerKfAt(selLayer); if (k) updateLayer(selLayer.id, (l) => ({ ...l, keyframes: l.keyframes.filter((x) => x.id !== k.id) })); },
+            })
           : h(CameraInspector, {
               project, time, fps, cover, kfAt, bullet: images.fgSeq ? images.fgSeq.length : 0,
               pending, viewKeyframes: pending ? withPending(project, time, pending).keyframes : null,
@@ -1814,7 +2666,7 @@
               onDeleteKf: () => kfAt && deleteKf(kfAt.id),
               onEase: (ease) => change((p) => ({ ...p, keyframes: p.keyframes.map((k) => (k.id === kfAt.id ? withEase(k, ease) : k)) })),
             }),
-        selCaption && h("button", { className: "pxs-link", onClick: () => setSelection({ type: "camera" }) }, "← Camera")
+        (selCaption || selLayer) && h("button", { className: "pxs-link", onClick: () => setSelection({ type: "camera" }) }, "← Camera")
       ),
       h(Timeline, {
         project, time, setTime, fps, playing, setPlaying, selection, setSelection, change, commit, addCaption, addKf, cutLabel,
