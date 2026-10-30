@@ -108,6 +108,7 @@
         const { base } = await backend();
         return { ...r, before: `${base}/parallax/file/${r.before}`, after: `${base}/parallax/file/${r.after}` };
       }),
+      analyse: (b) => api("enhance/analyse", { scene_id: sid, start: b.start, duration: b.duration }),
       cancel: (job) => api(`fps/${job.id}/cancel`, {}),
       videoSrc: (info, direct) => {
         const playable = direct && /^(h264|hevc|vp8|vp9|av1)$/i.test(info.video.codec || "");
@@ -188,6 +189,7 @@
       settingsKey: "enhance-image-settings",
       load: () => api(`enhance-image?${kind}=${id}`).then((d) => ({ ...d, images: d.images.map(img) })),
       probe: (i) => api("enhance-image/probe", { image_id: i.key }),
+      analyse: (i) => api("enhance-image/analyse", { image_id: i.key }),
       preview: (b) => api("enhance-image/preview", { image_id: b.img.key, settings: b.settings, mask: b.mask }).then(async (r) => {
         const { base } = await backend();
         return { ...r, before: `${base}/parallax/file/${r.before}`, after: `${base}/parallax/file/${r.after}` };

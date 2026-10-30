@@ -43,6 +43,8 @@ GET  /parallax/enhance-image?image=ID|gallery=ID  {title, images, jobs, availabl
 POST /parallax/enhance-image                  {image_id | gallery_id, only?, settings, masks: {image id: PNG data URL},
                                               label, summary, estimate} -> {job}: new images in <library>/Enhanced/
 POST /parallax/enhance-image/probe|preview|segment   {image_id, ...}: relayed to the service's /image/...
+POST /parallax/enhance-image/analyse|enhance/analyse   {image_id} | {scene_id, start?, duration?}: the service's
+                                              /analyse, for "Suggest settings"
 POST /parallax/enhance                        {scene_id, marker_id? | start, duration, settings, label, summary,
                                               estimate} -> {job}
 POST /parallax/enhance/callback               {event, job}: the enhance service reporting a job (X-Token needed)
@@ -818,6 +820,15 @@ class Parallax:
     def enhance_image_probe(self, body):
         return self.enhance_api("POST", "/image/probe", {"path": self.image_source(self.image_by_id(body.get("image_id")))}, timeout=180)
 
+    def enhance_image_analyse(self, body):
+        return self.enhance_api("POST", "/analyse", {"path": self.image_source(self.image_by_id(body.get("image_id")))}, timeout=180)
+
+    def enhance_analyse(self, body):
+        """What a scene (or a part of it) needs, for Enhance Studio's suggested settings."""
+        sc, f, scene, markers = self.enhance_scene_info(str(int(body.get("scene_id"))))
+        return self.enhance_api("POST", "/analyse", {"path": f["path"], "start": float(body.get("start") or 0),
+                                                     "duration": float(body.get("duration") or 0)}, timeout=600)
+
     def enhance_image_segment(self, body):
         return self.enhance_api("POST", "/image/segment", {"input": self.image_source(self.image_by_id(body.get("image_id"))),
                                                            "points": body.get("points") or []}, timeout=300)
@@ -1207,11 +1218,14 @@ class Parallax:
                 return 200, self.start_enhance_image(json.loads(raw or b"{}"))
             if p == "enhance/callback":
                 return 200, self.enhance_callback(json.loads(raw or b"{}"))
-            if p in ("enhance-image/probe", "enhance-image/preview", "enhance-image/segment"):
-                fn = {"probe": self.enhance_image_probe, "preview": self.enhance_image_preview, "segment": self.enhance_image_segment}
+            if p in ("enhance-image/probe", "enhance-image/preview", "enhance-image/segment", "enhance-image/analyse"):
+                fn = {"probe": self.enhance_image_probe, "preview": self.enhance_image_preview, "segment": self.enhance_image_segment,
+                      "analyse": self.enhance_image_analyse}
                 return 200, fn[p.split("/")[1]](json.loads(raw or b"{}"))
             if p == "enhance/preview":
                 return 200, self.enhance_preview(json.loads(raw or b"{}"))
+            if p == "enhance/analyse":
+                return 200, self.enhance_analyse(json.loads(raw or b"{}"))
             # Parallax Studio: the parallax service's
             if p == "callback":
                 return 200, self.parallax_callback(json.loads(raw or b"{}"))

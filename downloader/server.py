@@ -1149,7 +1149,7 @@ def start_backfill(credits):
 def parallax_python(args):
     if args.parallax_python:
         return args.parallax_python
-    gpu = os.path.expanduser("~/.local/share/stash-downloader/ml-gpu-venv/bin/python")
+    gpu = "/media/matt/WD/ai/ml-venv/bin/python"  # the ML venv the enhance and parallax services use
     if os.path.exists(gpu):
         try:
             p = subprocess.run([gpu, "-I", "-c", "import onnxruntime, cv2, numpy; print(onnxruntime.get_available_providers())"],
@@ -1181,9 +1181,9 @@ def main():
                     help="comma-separated sites whose videos get their end credits read")
     ap.add_argument("--state", default=os.path.expanduser("~/.local/share/stash-downloader/state.json"))
     ap.add_argument("--parallax-python", default=os.environ.get("PARALLAX_PYTHON", ""),
-                    help="python for the AI frames and upscale jobs' models (default: the GPU venv "
-                         "~/.local/share/stash-downloader/ml-gpu-venv if it works, else --ocr-python)")
-    ap.add_argument("--models-dir", default=os.path.expanduser("~/.local/share/stash-downloader/models"),
+                    help="python for the AI frames and upscale jobs' models (default: the ML venv "
+                         "/media/matt/WD/ai/ml-venv if it works on the GPU, else --ocr-python)")
+    ap.add_argument("--models-dir", default="/media/matt/WD/ai/models",
                     help="ONNX models for the AI frames and upscale jobs (RIFE, Real-ESRGAN)")
     ap.add_argument("--parallax-dir", default=os.path.expanduser("~/.local/share/stash-downloader/parallax"),
                     help="AI job records, Enhance Studio previews and Parallax Studio's exported scenes (outside the library)")
