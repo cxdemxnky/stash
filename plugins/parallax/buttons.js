@@ -16,6 +16,12 @@
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
     '<path d="M3 17l6-6 4 4 3-3 5 5"/><rect x="2" y="4" width="20" height="16" rx="2"/>' +
     '<circle cx="9" cy="8" r="1.6" fill="currentColor"/></svg>';
+  // the Enhance buttons: stars
+  const STARS =
+    '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M10 4l1.8 4.7L16.5 10.5l-4.7 1.8L10 17l-1.8-4.7L3.5 10.5l4.7-1.8z"/>' +
+    '<path d="M18 3v4M16 5h4M18 15v4M16 17h4"/></svg>';
 
   let routerHistory = null;
   function HistoryGrabber() {
@@ -46,7 +52,7 @@
     return [{ ...props, children: h(React.Fragment, null, props.children, item, h(HistoryGrabber, { key: "parallax-history" })) }];
   });
 
-  function makeButton(id, target, title, label, onClick) {
+  function makeButton(id, target, title, label, onClick, icon = ICON) {
     const wrapper = document.createElement("span");
     const button = document.createElement("button");
     button.id = id;
@@ -54,7 +60,7 @@
     button.dataset.target = target;
     button.className = "minimal btn btn-secondary pxs-page-button";
     button.title = title;
-    button.innerHTML = ICON + (label ? `<span>${label}</span>` : "");
+    button.innerHTML = icon + (label ? `<span>${label}</span>` : "");
     button.addEventListener("click", onClick);
     wrapper.appendChild(button);
     return wrapper;
@@ -170,8 +176,8 @@
       const group = lastGroup(".image-toolbar .image-toolbar-group");
       if (!group) return;
       group.insertBefore(
-        makeButton("parallax-enhance-image-button", image[1], "Enhance this image: restore, upscale, colourise, faces, background (a new copy)", "Enhance",
-          () => go(`/enhance-image?image=${image[1]}`)),
+        makeButton("parallax-enhance-image-button", image[1], "Enhance this image: restore, upscale, colourise, faces, background (a new copy)", "",
+          () => go(`/enhance-image?image=${image[1]}`), STARS),
         group.firstChild
       );
     });
@@ -182,8 +188,8 @@
       const group = groups[groups.length - 1];
       if (!group) return;
       group.insertBefore(
-        makeButton("parallax-enhance-gallery-button", gallery[1], "Enhance the images of this gallery (a new gallery)", "Enhance",
-          () => go(`/enhance-image?gallery=${gallery[1]}`)),
+        makeButton("parallax-enhance-gallery-button", gallery[1], "Enhance the images of this gallery (a new gallery)", "",
+          () => go(`/enhance-image?gallery=${gallery[1]}`), STARS),
         group.firstChild
       );
     });
@@ -194,13 +200,13 @@
       if (!group) return;
       group.insertBefore(
         makeButton("parallax-enhance-button", scene[1], "Enhance Studio: deinterlace, clean up, upscale or change the frame rate (made as a new scene)",
-          "Enhance", () => {
+          "", () => {
             const el = document.querySelector(".video-js");
             const player = el && el.player;
             const t = player ? player.currentTime() || 0 : 0;
             if (player) player.pause();
             go(`/enhance?scene=${scene[1]}${t > 0 ? `&t=${t.toFixed(2)}` : ""}`);
-          }),
+          }, STARS),
         group.firstChild
       );
     });
