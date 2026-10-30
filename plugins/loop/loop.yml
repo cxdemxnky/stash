@@ -1,0 +1,8 @@
+name: Loop
+description: A Loop button in the scene player's control bar. When it's on, every scene plays over and over until it's turned off (remembered in the browser); Shift+L toggles it too.
+version: 1.0.0
+ui:
+  javascript:
+    - loop.js
+  css:
+    - loop.css

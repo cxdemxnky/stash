@@ -1,0 +1,10 @@
+.video-js .stash-loop-button {
+  cursor: pointer;
+  opacity: 0.6;
+}
+.video-js .stash-loop-button:hover { opacity: 1; }
+.video-js .stash-loop-button svg { vertical-align: middle; }
+.video-js .stash-loop-button.stash-loop-on {
+  color: #4da3ff;
+  opacity: 1;
+}
