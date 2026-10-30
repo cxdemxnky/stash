@@ -7,7 +7,8 @@ applies the metadata (studio, show group, season/episode, performers, tags, cove
 
 Standard library only; HLS streams are downloaded with ffmpeg. Performer names are
 read from end credits by credits.py, run with a separate OCR venv (--ocr-python).
-Parallax Studio (/parallax/...) lives in parallax_service.py and parallax.py.
+Parallax Studio, Enhance Studio and the AI jobs (/parallax/...) are in parallax_service.py:
+the studios relay to their own services (parallax and enhance), which call back here.
 
 Job format (POST /jobs):
 {
@@ -1154,7 +1155,7 @@ def parallax_python(args):
             p = subprocess.run([gpu, "-I", "-c", "import onnxruntime, cv2, numpy; print(onnxruntime.get_available_providers())"],
                                capture_output=True, text=True, timeout=60)
             if p.returncode == 0 and "CUDAExecutionProvider" in p.stdout:
-                log("parallax studio: using the GPU venv")
+                log("AI jobs: using the GPU venv")
                 return gpu
         except (OSError, subprocess.SubprocessError):
             pass
@@ -1180,12 +1181,12 @@ def main():
                     help="comma-separated sites whose videos get their end credits read")
     ap.add_argument("--state", default=os.path.expanduser("~/.local/share/stash-downloader/state.json"))
     ap.add_argument("--parallax-python", default=os.environ.get("PARALLAX_PYTHON", ""),
-                    help="python for Parallax Studio's models (default: the GPU venv "
+                    help="python for the AI frames and upscale jobs' models (default: the GPU venv "
                          "~/.local/share/stash-downloader/ml-gpu-venv if it works, else --ocr-python)")
     ap.add_argument("--models-dir", default=os.path.expanduser("~/.local/share/stash-downloader/models"),
-                    help="ONNX models for Parallax Studio (person cut-out and background fill)")
+                    help="ONNX models for the AI frames and upscale jobs (RIFE, Real-ESRGAN)")
     ap.add_argument("--parallax-dir", default=os.path.expanduser("~/.local/share/stash-downloader/parallax"),
-                    help="Parallax Studio layers and projects (outside the library)")
+                    help="AI job records, Enhance Studio previews and Parallax Studio's exported scenes (outside the library)")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.state), exist_ok=True)
@@ -1198,10 +1199,9 @@ def main():
         threading.Thread(target=start_backfill, args=(svc.credits,), daemon=True).start()
     else:
         log("OCR python not found at %s; reading end credits is disabled" % args.ocr_python)
-    # Parallax Studio runs its models with onnxruntime + opencv: on the GPU when the
-    # GPU venv is installed and works, else with the OCR venv's python on the CPU
+    # the AI frames and upscale jobs run their models with onnxruntime + opencv: on the
+    # GPU when the GPU venv is installed and works, else with the OCR venv's python on the CPU
     svc.parallax = Parallax(svc.stash, parallax_python(args), args.models_dir, args.parallax_dir, svc.media_dir, http_request)
-    log("parallax studio: %s" % (svc.parallax.status()["reason"] or "ready"))
     for _ in range(svc.fixed_workers or MAX_WORKERS):
         threading.Thread(target=svc.run, daemon=True).start()
     threading.Thread(target=svc.tune, daemon=True).start()

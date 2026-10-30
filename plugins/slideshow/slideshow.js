@@ -50,7 +50,7 @@
     "bottom-left", "bottom-center", "bottom-right",
   ];
 
-  // shared with the Parallax Studio plugin, which draws the same captions on a canvas
+  // the parallax service's render.js has the same fonts, blend modes and positions (its captions look the same)
   window.SlideshowCaptions = { FONTS, BLEND_MODES, POSITIONS };
 
   const DEFAULTS = {

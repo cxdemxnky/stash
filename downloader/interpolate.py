@@ -29,7 +29,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from parallax import RIFE_FILE, rife, session  # noqa: E402
+from onnx_models import RIFE_FILE, rife, session  # noqa: E402
 from upscale import upscale  # noqa: E402
 
 CUT_DIFF = 40  # mean absolute difference (0..255) at a quarter size that counts as a hard cut

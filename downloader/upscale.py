@@ -2,8 +2,7 @@
 """AI upscaling with Real-ESRGAN (realesr-general-x4v3), for stills, images and video.
 
 Run with the ML venv's python (onnxruntime-gpu, numpy, opencv). Used as a module
-by parallax.py (upscaling a still before the cut-out) and interpolate.py (video
-frames), and from the command line for Stash images:
+by interpolate.py (video frames), and from the command line for Stash images:
 
   upscale.py INPUT OUTPUT --models DIR [--factor 2|4]
   upscale.py --batch LIST.json --models DIR [--factor 2|4]    (LIST: [[input, output], ...])
@@ -24,7 +23,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from parallax import session  # noqa: E402  (shared ONNX session setup: GPU when available)
+from onnx_models import session  # noqa: E402  (shared ONNX session setup: GPU when available)
 
 UPSCALE_FILE = "realesr-general-x4v3.onnx"
 NATURAL = 0.6  # default strength

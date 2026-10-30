@@ -1,43 +1,25 @@
-"""Parallax Studio backend for the downloader service (standard library only).
+"""Parallax Studio, Enhance Studio and the AI jobs, for the downloader service
+(standard library only). Everything here is under /parallax/ on this port, as
+Stash's CSP only lets its pages reach this one.
 
-Stills (a Stash image, or a scene frame at a given time) are split by parallax.py
-into a person layer and a filled-in background. Everything lives outside the
-library, under --parallax-dir, so Stash never sees the layers:
+Parallax Studio is the parallax service's (/media/matt/WD/tmp/parallax, its own
+API and web app at PARALLAX_URL). The Stash plugin loads the studio from it
+through here (/parallax/ui/...) and its API calls are relayed to it, except
+that a still is named the Stash way, {kind: "image", id} or {kind: "scene", id,
+time, span?}: this side turns that into the file's path, and gives new projects
+a title, a link back to Stash (meta), Stash's Parallax folder for their exports
+and a callback. When an export is done the service calls back
+(/parallax/callback); the video is then scanned into Stash with its source's
+metadata and tagged "Parallax", and the scene's link goes back to the studio.
 
-  layers/<source-key>/source.<ext>          the still (image-<id> | scene-<id>-<ms>[-bt<ms>])
-  layers/<source-key>/frames/               bullet time: the frames of <ms> of video, f_NNN.jpg + info.json
-  layers/<source-key>/<cut-id>/             mask.png person.png background.png
-                                            background_ext.png (with an outpainted border) meta.json
-  projects/<project-id>.json                saved by the studio (the client owns it)
-  projects/<project-id>.jpg                 thumbnail for the project list
-  projects/<project-id>.export.json         server-owned: exported file and scene id
-  exports/<project-id>.mp4.part             an export being encoded
-
-Exports are encoded by ffmpeg from JPEG frames the studio renders and streams in
-(so preview and export use the same renderer), then moved to
-<media>/Parallax/, scanned into Stash and tagged "Parallax".
-
-GET  /parallax/status                         {enabled, reason, models}
-GET  /parallax/projects[?source=KEY|?scene=ID] project summaries
-GET  /parallax/project/<id>                   the project, plus "export"
-GET  /parallax/cuts?source=KEY                cuts of a source, newest first
-GET  /parallax/job/<id>                       {state, stage, progress, error, cut}
-GET  /parallax/file/<path>                    a layer/thumbnail file (CORS, for canvases)
-POST /parallax/project                        {source: {kind, id, time?, span?}, title?, settings?} -> project
-POST /parallax/project/<id>                   save the project (body = project; "thumb" = data URL)
-POST /parallax/project/<id>/delete
-POST /parallax/project/<id>/duplicate         a new version: a copy with no export, titled "... vN"
-POST /parallax/cut                            {source, settings} -> {job}
-POST /parallax/extend                         {source_key, cut} -> {job}: outpaint an older cut's background
-POST /parallax/segment                        {source_key, cut, points: [[x, y, 1|0]]} -> {masks: [{mask: data URL,
-                                              score, area}], pick}: click-to-select (MobileSAM) on the cut's
-                                              person layer; one click gives up to 3 sizes, smallest first
-POST /parallax/mask                           {source_key, png: data URL} -> {file}: a layer's mask, kept
-                                              with the source's cuts (masks/<id>.png)
-POST /parallax/export/<id>/start              {width, height, fps, frames}
-POST /parallax/export/<id>/frames             raw concatenated JPEGs
-POST /parallax/export/<id>/finish             -> {scene_id, path}
-POST /parallax/export/<id>/cancel
+GET  /parallax/ui/render.js|studio.js|parallax.css   the studio, from the service
+GET  /parallax/status|projects|project/<id>|cuts|job/<id>|file/<path>   relayed
+GET  /parallax/projects?scene=ID              the project exported as that scene (from parallax_exports.json)
+POST /parallax/source|project                 a Stash still -> relayed with its path (and, for a new project,
+                                              title, meta, output folder and callback)
+POST /parallax/project/<id>[/delete|/duplicate], cut, extend, segment, mask, export/<id>/...   relayed
+POST /parallax/callback                       {event: "exported", project, export}: the service reporting an
+                                              export (X-Token needed) -> {link, scene_id}
 
 AI frames (a separate tool on scene pages, using the same RIFE model): a smoother
 video at a higher frame rate, or slow motion.
@@ -70,9 +52,7 @@ option is one of FPS_OPTIONS. The new video is written outside the library
 (FPS_WORK), then moved next to the original, scanned in as a new scene with the
 original's metadata, and tagged. The original is never changed.
 """
-import base64
 import json
-import mimetypes
 import os
 import re
 import shutil
@@ -85,18 +65,20 @@ import urllib.parse
 import urllib.request
 import uuid
 
-PARALLAX_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parallax.py")
 UPSCALE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscale.py")
 INTERPOLATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpolate.py")
 ENHANCE_URL = os.environ.get("ENHANCE_URL", "http://127.0.0.1:10142").rstrip("/")  # the enhance service
 ENHANCE_TOKEN = os.environ.get("ENHANCE_TOKEN", "")  # from ~/.config/enhance/env (see the unit file)
 # where the service reports progress and finished jobs (this service; DOWNLOADER_TOKEN is how it gets in)
 ENHANCE_CALLBACK = os.environ.get("ENHANCE_CALLBACK_URL", "http://127.0.0.1:10141/parallax/enhance/callback")
-STASH_LINK = "http://{host}:10140"  # for the service's job list ("{host}": the host it's viewed from)
+STASH_LINK = "http://{host}:10140"  # for the services' web apps ("{host}": the host they're viewed from)
+PARALLAX_URL = os.environ.get("PARALLAX_URL", "http://127.0.0.1:10143").rstrip("/")  # the parallax service
+PARALLAX_TOKEN = os.environ.get("PARALLAX_TOKEN", "")  # from ~/.config/parallax/env
+PARALLAX_CALLBACK = os.environ.get("PARALLAX_CALLBACK_URL", "http://127.0.0.1:10141/parallax/callback")
+PARALLAX_DIR = "Parallax"  # folder in the library for exported clips
+PARALLAX_SRC = "/media/matt/WD/tmp/.parallax-src"  # copies of images inside zips, for the service (kept: re-cuts read them)
+PARALLAX_UI = ("render.js", "studio.js", "parallax.css")
 ENHANCE_TAG = "Enhanced (AI)"
-SEGMENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segment.py")
-SEGMENT_MODELS = ("mobile_sam_image_encoder.onnx", "sam_mask_decoder_multi.onnx")
-SEGMENT_IDLE = 300  # seconds without clicks before the segment worker (and its GPU memory) goes
 # option: (mode, factor, file suffix, title suffix, tag); {fps} is the new frame rate
 FPS_OPTIONS = {
     "clip": ("clip", 1, "", "", None),  # markers: just the part, no AI frames
@@ -119,12 +101,7 @@ IMAGE_OVERHEAD = 0.6
 UHD_WIDTH = 3840
 FPS_SPEED = 2.5  # default AI megapixel-frames made per second (measured: 1080p at ~1.2 frame/s)
 PARALLAX_TAG = "Parallax"
-REQUIRED_MODELS = ("u2net_human_seg.onnx", "lama_fp32.onnx")
 OPTIONAL_MODELS = {"general": "isnet-general-use.onnx", "rife": "rife49.onnx", "upscale": "realesr-general-x4v3.onnx"}
-ID_RE = re.compile(r"^[a-f0-9]{12}$")
-KEY_RE = re.compile(r"^(image-\d+|scene-\d+-\d+(-bt\d+)?)$")
-BULLET_MAX = 3.0  # seconds of video a bullet-time source may span
-
 
 def log(msg):
     print(time.strftime("%H:%M:%S"), "parallax:", msg, flush=True)
@@ -145,26 +122,6 @@ def read_json(path, default=None):
         return default
 
 
-def source_key(src):
-    if src.get("kind") == "image":
-        return "image-%d" % int(src["id"])
-    if src.get("kind") == "scene":
-        key = "scene-%d-%d" % (int(src["id"]), round(float(src.get("time") or 0) * 1000))
-        span = float(src.get("span") or 0)
-        if span > 0:  # bullet time: this much video from that point
-            key += "-bt%d" % round(min(span, BULLET_MAX) * 1000)
-        return key
-    raise ValueError("source.kind must be image or scene")
-
-
-class Export:
-    def __init__(self, path, proc, frames):
-        self.path = path
-        self.proc = proc
-        self.frames = frames
-        self.lock = threading.Lock()
-
-
 class Parallax:
     def __init__(self, stash, python, models_dir, root, media_dir, http_request):
         self.stash = stash
@@ -173,14 +130,7 @@ class Parallax:
         self.root = root
         self.media_dir = media_dir
         self.http_request = http_request
-        for d in ("layers", "projects", "exports"):
-            os.makedirs(os.path.join(root, d), exist_ok=True)
-        self.jobs = {}
-        self.queue = []
-        self.cond = threading.Condition()
-        self.exports = {}
-        self.project_lock = threading.Lock()
-        threading.Thread(target=self.run, daemon=True).start()
+        os.makedirs(root, exist_ok=True)
         # double-frame-rate jobs: hours long, so their own queue, one at a time
         self.fps_jobs = {}
         self.fps_queue = []
@@ -191,133 +141,50 @@ class Parallax:
         # Enhance Studio jobs run in the enhance service, which calls back (enhance_callback)
         self.enhance_lock = threading.Lock()
         threading.Thread(target=self.enhance_reconcile, daemon=True).start()
-        # click-to-select: one long-lived worker, so clicks don't each load the model
-        self.seg_proc = None
-        self.seg_lock = threading.Lock()
-        self.seg_used = 0
-        threading.Thread(target=self.reap_segmenter, daemon=True).start()
+        # Parallax Studio exports scanned into Stash: {project id: {scene_id, path}}
+        self.parallax_lock = threading.Lock()
 
-    # ------------------------------------------------------------ status
+    # ------------------------------------------------------------ Parallax Studio (the parallax service)
 
-    def status(self):
-        missing = [m for m in REQUIRED_MODELS if not os.path.exists(os.path.join(self.models_dir, m))]
-        reason = None
-        if not os.path.exists(self.python):
-            reason = "ML python not found at %s" % self.python
-        elif missing:
-            reason = "models missing in %s: %s" % (self.models_dir, ", ".join(missing))
-        elif not shutil.which("ffmpeg"):
-            reason = "ffmpeg not found"
-        models = ["human"] + [k for k, f in OPTIONAL_MODELS.items() if os.path.exists(os.path.join(self.models_dir, f))]
-        if all(os.path.exists(os.path.join(self.models_dir, f)) for f in SEGMENT_MODELS):
-            models.append("segment")
-        return {"enabled": reason is None, "reason": reason, "models": models}
-
-    # ------------------------------------------------------------ projects
-
-    def project_path(self, pid, ext=".json"):
-        if not ID_RE.match(pid or ""):
-            raise ValueError("bad project id")
-        return os.path.join(self.root, "projects", pid + ext)
-
-    def load_project(self, pid):
-        p = read_json(self.project_path(pid))
-        if p is None:
-            raise KeyError("no such project")
-        p["export"] = read_json(self.project_path(pid, ".export.json"))
-        return p
-
-    def summaries(self, source=None, scene=None):
-        out = []
-        d = os.path.join(self.root, "projects")
-        for name in os.listdir(d):
-            if not name.endswith(".json") or name.endswith(".export.json"):
-                continue
-            pid = name[:-5]
+    def parallax_api(self, method, path, body=None, raw=None, timeout=60):
+        """The service's answer to a request: JSON, or (bytes, content type) when raw
+        is True (files). raw bytes are sent as the body as they are."""
+        data = raw if isinstance(raw, bytes) else None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(PARALLAX_URL + path, method=method, data=data,
+                                     headers={"X-Token": PARALLAX_TOKEN, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out, ctype = r.read(), r.headers.get("Content-Type") or "application/octet-stream"
+        except urllib.error.HTTPError as e:
             try:
-                p = self.load_project(pid)
-            except (KeyError, ValueError):
-                continue
-            if source and p.get("source_key") != source:
-                continue
-            exp = p.get("export") or {}
-            if scene and str(exp.get("scene_id")) != str(scene):
-                continue
-            out.append({
-                "id": pid, "title": p.get("title"), "source": p.get("source"), "source_key": p.get("source_key"),
-                "created": p.get("created"), "updated": p.get("updated"),
-                "thumb": "projects/%s.jpg" % pid if os.path.exists(self.project_path(pid, ".jpg")) else None,
-                "scene_id": exp.get("scene_id"),
-            })
-        out.sort(key=lambda p: p.get("updated") or 0, reverse=True)
-        return out
+                msg = json.loads(e.read())["error"]
+            except (ValueError, KeyError, OSError):
+                msg = "parallax service: HTTP %d" % e.code
+            raise KeyError(msg) if e.code == 404 else ValueError(msg)
+        except OSError as e:
+            raise ValueError("the parallax service isn't running at %s: %s" % (PARALLAX_URL, getattr(e, "reason", e)))
+        return (out, ctype) if raw is True else json.loads(out)
 
-    def create_project(self, body):
-        src = body.get("source") or {}
-        key = source_key(src)
-        pid = uuid.uuid4().hex[:12]
-        now = time.time()
-        title = body.get("title") or self.source_title(src)
-        project = {
-            "id": pid, "version": 1, "title": title, "source": src, "source_key": key,
-            "cut_id": None, "created": now, "updated": now,
-        }
-        write_json(self.project_path(pid), project)
-        log("project %s created for %s" % (pid, key))
-        # reuse a cut of this source (one with the asked-for AI frames, for bullet time)
-        want = int((body.get("settings") or {}).get("interp") or 1)
-        cut = next((c for c in self.cuts(key) if int(c["meta"].get("interp", 1)) == want), None)
-        job = None
-        if cut:
-            project["cut_id"] = cut["id"]
-            write_json(self.project_path(pid), project)
-        else:
-            job = self.start_cut({"source": src, "settings": body.get("settings") or {}})["job"]
-        project["export"] = None
-        return {"project": project, "job": job}
+    def exports_path(self):
+        return os.path.join(self.root, "parallax_exports.json")
 
-    def save_project(self, pid, body):
-        path = self.project_path(pid)
-        if not os.path.exists(path):
-            raise KeyError("no such project")
-        thumb = body.pop("thumb", None)
-        body.pop("export", None)  # server-owned, kept in the sidecar
-        body["id"] = pid
-        body["updated"] = time.time()
-        with self.project_lock:
-            write_json(path, body)
-        if thumb and thumb.startswith("data:image/jpeg;base64,"):
-            with open(self.project_path(pid, ".jpg"), "wb") as f:
-                f.write(base64.b64decode(thumb.split(",", 1)[1]))
-        return {"saved": True, "updated": body["updated"]}
-
-    def duplicate_project(self, pid):
-        """Copy a project as another version of the same still (its export stays with
-        the original, so the copy exports to a scene of its own)."""
-        p = self.load_project(pid)
-        p.pop("export", None)
-        versions = self.summaries(source=p.get("source_key"))
-        base = re.sub(r"\s+v\d+$", "", p.get("title") or "Parallax")
-        taken = {s.get("title") for s in versions}
-        n = len(versions) + 1
-        while "%s v%d" % (base, n) in taken:
-            n += 1
-        new = uuid.uuid4().hex[:12]
-        now = time.time()
-        p.update(id=new, title="%s v%d" % (base, n), created=now, updated=now)
-        write_json(self.project_path(new), p)
-        if os.path.exists(self.project_path(pid, ".jpg")):
-            shutil.copyfile(self.project_path(pid, ".jpg"), self.project_path(new, ".jpg"))
-        log("project %s duplicated as %s (%s)" % (pid, new, p["title"]))
-        return {"project": p}
-
-    def delete_project(self, pid):
-        for ext in (".json", ".jpg", ".export.json"):
-            try:
-                os.remove(self.project_path(pid, ext))
-            except FileNotFoundError:
-                pass
-        return {"deleted": pid}
+    def stash_source(self, src):
+        """A Stash still ({kind: "image", id} | {kind: "scene", id, time, span?}) as
+        the service names it: {kind: "image", path} | {kind: "video", path, time, span?}.
+        Sources that already have a path pass through."""
+        if not isinstance(src, dict) or src.get("path") or "id" not in src:
+            return src
+        if src.get("kind") == "image":
+            return {"kind": "image", "path": self.image_source(self.image_by_id(src["id"]), PARALLAX_SRC)}
+        if src.get("kind") == "scene":
+            sc = self.stash.gql("query($id: ID!) { findScene(id: $id) { files { path } } }", {"id": str(int(src["id"]))})["findScene"]
+            if not sc or not sc["files"]:
+                raise KeyError("scene %s has no file" % src["id"])
+            out = {"kind": "video", "path": sc["files"][0]["path"], "time": float(src.get("time") or 0)}
+            if src.get("span"):
+                out["span"] = float(src["span"])
+            return out
+        raise ValueError("source.kind must be image or scene")
 
     def source_title(self, src):
         try:
@@ -332,346 +199,68 @@ class Parallax:
                 name = sc["title"] or os.path.splitext(os.path.basename(sc["files"][0]["path"]))[0]
             return "%s (%s)" % (name, "Bullet time" if src.get("span") else "Parallax")
         except Exception:
-            return "Parallax %s" % source_key(src)
+            return None  # the service names it after the file
 
-    # ------------------------------------------------------------ layers
-
-    def layer_dir(self, key):
-        if not KEY_RE.match(key or ""):
-            raise ValueError("bad source key")
-        return os.path.join(self.root, "layers", key)
-
-    def cuts(self, key):
-        d = self.layer_dir(key)
-        out = []
-        if os.path.isdir(d):
-            for cid in os.listdir(d):
-                meta = read_json(os.path.join(d, cid, "meta.json"))
-                if meta:
-                    base = "layers/%s/%s/" % (key, cid)
-                    has_ext = os.path.exists(os.path.join(d, cid, "background_ext.png"))
-                    out.append({"id": cid, "meta": meta, "created": os.path.getmtime(os.path.join(d, cid, "meta.json")),
-                                "person": base + "person.png", "background": base + "background.png",
-                                "background_ext": base + "background_ext.png" if has_ext else None,
-                                # bullet time: the person's frames, %03d = 0 .. frames - 1
-                                "sequence": base + meta["sequence"] if meta.get("sequence") else None,
-                                "mask": base + "mask.png"})
-        out.sort(key=lambda c: c["created"], reverse=True)
-        src = next((n for n in os.listdir(d) if n.startswith("source.") and not n.endswith(".part")), None) \
-            if os.path.isdir(d) else None
-        for c in out:
-            c["source"] = "layers/%s/%s" % (key, src) if src else None
-        return out
-
-    def fetch_frames(self, src, key):
-        """Bullet time: the frames of src["span"] seconds of the scene from src["time"],
-        extracted once into frames/ (with their rate in info.json), plus the middle
-        one as the source still. Returns (frames dir, fps)."""
-        d = self.layer_dir(key)
-        fd = os.path.join(d, "frames")
-        info = read_json(os.path.join(fd, "info.json"))
-        if info:
-            return fd, info["fps"]
-        sc = self.stash.gql("query($id: ID!) { findScene(id: $id) { files { path frame_rate } } }", {"id": src["id"]})["findScene"]
-        if not sc or not sc["files"]:
-            raise RuntimeError("scene %s has no file" % src["id"])
-        f = sc["files"][0]
-        fps = float(f.get("frame_rate") or 30) or 30
-        span = min(float(src.get("span") or 1), BULLET_MAX)
-        tmp = fd + ".part"
-        shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp)
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "%.3f" % float(src.get("time") or 0), "-i", f["path"],
-                        "-frames:v", str(max(2, round(span * fps))), "-q:v", "2", os.path.join(tmp, "f_%03d.jpg")],
-                       check=True, capture_output=True, timeout=300)
-        names = sorted(os.listdir(tmp))
-        if len(names) < 2:
-            raise RuntimeError("couldn't read frames from the scene at that point")
-        shutil.copyfile(os.path.join(tmp, names[len(names) // 2]), os.path.join(d, "source.jpg"))
-        write_json(os.path.join(tmp, "info.json"), {"fps": fps, "frames": len(names), "span": span})
-        shutil.rmtree(fd, ignore_errors=True)
-        os.replace(tmp, fd)
-        return fd, fps
-
-    def fetch_source(self, src, key):
-        """The still for a source, extracted once and kept next to its cuts."""
-        d = self.layer_dir(key)
-        os.makedirs(d, exist_ok=True)
-        if src.get("span"):
-            self.fetch_frames(src, key)
-        for name in os.listdir(d):
-            if name.startswith("source."):
-                return os.path.join(d, name)
-        if src["kind"] == "image":
-            base = self.stash.url[: -len("/graphql")]
-            headers = {"ApiKey": self.stash.api_key} if self.stash.api_key else {}
-            with self.http_request("%s/image/%d/image" % (base, int(src["id"])), headers) as r:
-                ext = mimetypes.guess_extension((r.headers.get("Content-Type") or "image/jpeg").split(";")[0]) or ".jpg"
-                path = os.path.join(d, "source" + (".jpg" if ext in (".jpe", ".jpeg") else ext))
-                with open(path + ".part", "wb") as f:
-                    shutil.copyfileobj(r, f)
-        else:
-            sc = self.stash.gql("query($id: ID!) { findScene(id: $id) { files { path } } }", {"id": src["id"]})["findScene"]
-            if not sc or not sc["files"]:
-                raise RuntimeError("scene %s has no file" % src["id"])
-            path = os.path.join(d, "source.png")
-            subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "%.3f" % float(src.get("time") or 0),
-                            "-i", sc["files"][0]["path"], "-frames:v", "1", "-f", "image2", "-c:v", "png",
-                            path + ".part"], check=True, capture_output=True, timeout=120)
-        os.replace(path + ".part", path)
-        return path
-
-    def start_cut(self, body):
+    def create_project(self, body):
+        """A new project for a Stash still: its path, title, a link back to it, the
+        library's Parallax folder for the export, and this side's callback."""
         src = body.get("source") or {}
-        key = source_key(src)
-        s = body.get("settings") or {}
-        settings = {
-            "model": s.get("model") if s.get("model") in ("human", "general") else "human",
-            "people": "main" if s.get("people") == "main" else "all",
-            "soft": max(0.0, min(20.0, float(s.get("soft", 2)))),
-            "grow": max(-40, min(40, int(s.get("grow", 0)))),
-            "fill": "fast" if s.get("fill") == "fast" else "lama",
-            # bullet time: RIFE in-between frames per source frame
-            "interp": int(s.get("interp") or 1) if int(s.get("interp") or 1) in (1, 2, 4) else 1,
-            # stills: AI-upscale before the cut-out, for sharper zooms
-            "upscale": int(s.get("upscale") or 1) if int(s.get("upscale") or 1) in (1, 2, 4) else 1,
-        }
-        jid = uuid.uuid4().hex[:12]
-        job = {"id": jid, "state": "queued", "stage": "waiting", "progress": 0, "error": None,
-               "source": src, "source_key": key, "settings": settings, "cut": None}
-        with self.cond:
-            self.jobs[jid] = job
-            self.queue.append(jid)
-            self.cond.notify()
-        return {"job": jid}
-
-    def run(self):
-        while True:
-            with self.cond:
-                while not self.queue:
-                    self.cond.wait()
-                job = self.jobs[self.queue.pop(0)]
-            try:
-                self.extend(job) if job.get("kind") == "extend" else self.cut(job)
-            except Exception as e:
-                traceback.print_exc()
-                job.update(state="error", error=str(e))
-
-    def cut(self, job):
-        job.update(state="running", stage="getting the still", progress=0.01)
-        source = self.fetch_source(job["source"], job["source_key"])
-        cid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
-        out = os.path.join(self.layer_dir(job["source_key"]), cid)
-        st = job["settings"]
-        if job["source"].get("span"):  # bullet time: cut every frame
-            job.update(stage="getting the frames")
-            frames, fps = self.fetch_frames(job["source"], job["source_key"])
-            args = ["--sequence", "--fps", str(fps), "--interp", str(st.get("interp", 1)), frames, out]
+        if src.get("path") or "id" not in src:
+            raise ValueError("source must be a Stash image or scene: {kind, id, ...}")
+        ref = {"kind": src["kind"], "id": int(src["id"])}
+        if src["kind"] == "scene":
+            t = float(src.get("time") or 0)
+            ref.update(time=t, **({"span": float(src["span"])} if src.get("span") else {}))
+            link = {"href": "%s/scenes/%d?t=%d" % (STASH_LINK, ref["id"], t),
+                    "text": "Scene %d @ %d:%05.2f%s" % (ref["id"], t // 60, t % 60, " · bullet time" if src.get("span") else "")}
         else:
-            args = [source, out]
-        args += ["--model", st["model"], "--people", st["people"], "--soft", str(st["soft"]),
-                 "--grow", str(st["grow"]), "--fill", st["fill"]]
-        if not job["source"].get("span") and st.get("upscale", 1) > 1:
-            args += ["--upscale", str(st["upscale"])]
-        try:
-            self.script(job, args)
-        except Exception:
-            shutil.rmtree(out, ignore_errors=True)
-            raise
-        job.update(state="done", stage="done", progress=1, cut=next(c for c in self.cuts(job["source_key"]) if c["id"] == cid))
-        log("cut %s/%s done in %.1fs" % (job["source_key"], cid, job["cut"]["meta"].get("seconds", 0)))
+            link = {"href": "%s/images/%d" % (STASH_LINK, ref["id"]), "text": "Image %d" % ref["id"]}
+        out = os.path.join(self.media_dir, PARALLAX_DIR)
+        os.makedirs(out, exist_ok=True)
+        title = body.get("title") or self.source_title(src)
+        return self.parallax_api("POST", "/project", dict(
+            body, source=self.stash_source(src), output=out, meta={"ref": ref, "link": link},
+            callback={"url": PARALLAX_CALLBACK, "headers": {"X-Token": os.environ.get("DOWNLOADER_TOKEN", "")}},
+            **({"title": title} if title else {})), timeout=120)
 
-    def start_extend(self, body):
-        key, cid = body.get("source_key"), body.get("cut") or ""
-        if not re.match(r"^[\w-]+$", cid) or not os.path.isdir(os.path.join(self.layer_dir(key), cid)):
-            raise KeyError("no such cut")
-        # one extend per cut at a time
-        for j in self.jobs.values():
-            if j.get("kind") == "extend" and j["source_key"] == key and j["cut_id"] == cid and j["state"] in ("queued", "running"):
-                return {"job": j["id"]}
-        jid = uuid.uuid4().hex[:12]
-        with self.cond:
-            self.jobs[jid] = {"id": jid, "kind": "extend", "state": "queued", "stage": "waiting", "progress": 0,
-                              "error": None, "source_key": key, "cut_id": cid, "cut": None}
-            self.queue.append(jid)
-            self.cond.notify()
-        return {"job": jid}
+    def parallax_callback(self, body):
+        """POST /parallax/callback, from the parallax service: an export is done. The
+        video is scanned in (a re-export overwrites the same file, so the same scene
+        is updated), given its source's metadata and tagged; the scene's link goes
+        back to the studio."""
+        if body.get("event") != "exported":
+            return {"ok": True}
+        project, exp = body.get("project") or {}, body.get("export") or {}
+        ref = (project.get("meta") or {}).get("ref")
+        if not ref or not exp.get("path"):
+            raise KeyError("not a Stash project")  # 404: the service stops retrying
+        target = exp["path"]
+        with self.parallax_lock:
+            self.stash.scan([target])
+            sid = self.stash.find_by_path("scene", target)
+            if not sid:
+                raise RuntimeError("Stash did not import %s" % target)  # 500: the service tries again later
+            self.apply_metadata(sid, project, ref)
+            exports = read_json(self.exports_path(), {}) or {}
+            exports[project["id"]] = {"scene_id": sid, "path": target, "exported": exp.get("exported")}
+            write_json(self.exports_path(), exports)
+        log("parallax export %s -> scene %s (%s)" % (project["id"], sid, target))
+        return {"link": {"href": "%s/scenes/%s" % (STASH_LINK, sid), "text": "Open scene"}, "scene_id": sid}
 
-    def extend(self, job):
-        job.update(state="running", stage="extending the background", progress=0.01)
-        t0 = time.time()
-        self.script(job, ["--extend-only", os.path.join(self.layer_dir(job["source_key"]), job["cut_id"])])
-        job.update(state="done", stage="done", progress=1,
-                   cut=next(c for c in self.cuts(job["source_key"]) if c["id"] == job["cut_id"]))
-        log("extended %s/%s in %.1fs" % (job["source_key"], job["cut_id"], time.time() - t0))
-
-    def script(self, job, args):
-        """Run parallax.py, reporting its stages on the job."""
-        cmd = ["nice", "-n", "10", self.python, "-I", PARALLAX_SCRIPT] + args + ["--models", self.models_dir]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        error = None
-        for line in p.stdout:
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if "error" in msg:
-                error = msg["error"]
-            elif "stage" in msg:
-                job.update(stage=msg["stage"], progress=msg["progress"])
-        err = p.stderr.read()
-        if p.wait() != 0:
-            raise RuntimeError(error or err.strip()[-400:] or "parallax.py failed")
-
-    # ------------------------------------------------------------ element layers
-
-    def cut_dir(self, key, cid):
-        if not re.match(r"^[\w-]+$", cid or ""):
-            raise ValueError("bad cut id")
-        d = os.path.join(self.layer_dir(key), cid)
-        if not os.path.isfile(os.path.join(d, "person.png")):
-            raise KeyError("no such cut")
-        return d
-
-    def segment(self, body):
-        """A mask of what the clicks pick out on a cut's person layer."""
-        d = self.cut_dir(body.get("source_key"), body.get("cut"))
-        pts = [[float(x), float(y), 1 if lab else 0] for x, y, lab in body.get("points") or []][:32]
-        if not pts:
-            raise ValueError("no points")
-        req = json.dumps({"person": os.path.join(d, "person.png"), "background": os.path.join(d, "background.png"),
-                          "cache": os.path.join(d, "sam_embedding.npy"), "points": pts}) + "\n"
-        with self.seg_lock:
-            for attempt in (0, 1):
-                if self.seg_proc is None or self.seg_proc.poll() is not None:
-                    self.seg_proc = subprocess.Popen(
-                        [self.python, "-I", SEGMENT_SCRIPT, "--models", self.models_dir],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                    ready = self.seg_proc.stdout.readline()
-                    if not ready:
-                        self.seg_proc = None
-                        raise RuntimeError("the segment worker didn't start")
-                try:
-                    self.seg_proc.stdin.write(req)
-                    self.seg_proc.stdin.flush()
-                    line = self.seg_proc.stdout.readline()
-                except (BrokenPipeError, OSError):
-                    line = ""
-                if line:
-                    break
-                self.seg_proc = None  # it died: start a fresh one once
-            self.seg_used = time.time()
-        if not line:
-            raise RuntimeError("the segment worker stopped")
-        out = json.loads(line)
-        if "error" in out:
-            raise RuntimeError(out["error"])
-        for m in out["masks"]:
-            m["mask"] = "data:image/png;base64," + m["mask"]
+    def project_summaries(self, q):
+        """The service's project list, with the Stash scene each was exported as;
+        ?scene=ID: only the project exported as that scene."""
+        exports = read_json(self.exports_path(), {}) or {}
+        scene = q.pop("scene", None)
+        path = "/projects" + ("?" + urllib.parse.urlencode(q) if q else "")
+        out = []
+        for p in self.parallax_api("GET", path):
+            p["scene_id"] = (exports.get(p["id"]) or {}).get("scene_id")
+            if not scene or str(p["scene_id"]) == str(scene):
+                out.append(p)
         return out
 
-    def reap_segmenter(self):
-        while True:
-            time.sleep(30)
-            with self.seg_lock:
-                if self.seg_proc and self.seg_proc.poll() is None and time.time() - self.seg_used > SEGMENT_IDLE:
-                    self.seg_proc.stdin.close()
-                    try:
-                        self.seg_proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        self.seg_proc.kill()
-                    self.seg_proc = None
-                    log("segment worker stopped (idle)")
-
-    def save_mask(self, body):
-        png = body.get("png") or ""
-        if not png.startswith("data:image/png;base64,"):
-            raise ValueError("png must be a PNG data URL")
-        key = body.get("source_key")
-        d = os.path.join(self.layer_dir(key), "masks")
-        os.makedirs(d, exist_ok=True)
-        name = uuid.uuid4().hex[:12] + ".png"
-        with open(os.path.join(d, name), "wb") as f:
-            f.write(base64.b64decode(png.split(",", 1)[1]))
-        return {"file": "layers/%s/masks/%s" % (key, name)}
-
-    def file(self, rel):
-        rel = urllib.parse.unquote(rel)
-        path = os.path.realpath(os.path.join(self.root, rel))
-        if not path.startswith(os.path.realpath(self.root) + os.sep) or not os.path.isfile(path):
-            raise KeyError("no such file")
-        with open(path, "rb") as f:
-            data = f.read()
-        return data, mimetypes.guess_type(path)[0] or "application/octet-stream"
-
-    # ------------------------------------------------------------ export
-
-    def export_start(self, pid, body):
-        self.load_project(pid)
-        self.export_cancel(pid)
-        w, h = int(body.get("width") or 1920), int(body.get("height") or 1080)
-        fps, frames = float(body.get("fps") or 30), int(body.get("frames") or 0)
-        if not (16 <= w <= 7680 and 16 <= h <= 4320 and 1 <= fps <= 120 and 1 <= frames <= 120 * 600):
-            raise ValueError("bad export size")
-        part = os.path.join(self.root, "exports", pid + ".mp4.part")
-        cmd = ["nice", "-n", "10", "ffmpeg", "-v", "error", "-y", "-f", "image2pipe", "-c:v", "mjpeg",
-               "-framerate", "%g" % fps, "-i", "-", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-               "-pix_fmt", "yuv420p", "-vf", "scale=%d:%d" % (w - w % 2, h - h % 2),
-               "-movflags", "+faststart", "-f", "mp4", part]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.exports[pid] = Export(part, proc, frames)
-        log("export %s started: %dx%d %g fps, %d frames" % (pid, w, h, fps, frames))
-        return {"started": True}
-
-    def export_frames(self, pid, data):
-        ex = self.exports.get(pid)
-        if not ex:
-            raise KeyError("no export in progress")
-        with ex.lock:
-            ex.proc.stdin.write(data)
-        return {"ok": True}
-
-    def export_cancel(self, pid):
-        ex = self.exports.pop(pid, None)
-        if ex:
-            ex.proc.kill()
-            ex.proc.wait()
-            try:
-                os.remove(ex.path)
-            except FileNotFoundError:
-                pass
-        return {"cancelled": bool(ex)}
-
-    def export_finish(self, pid):
-        ex = self.exports.pop(pid, None)
-        if not ex:
-            raise KeyError("no export in progress")
-        ex.proc.stdin.close()
-        err = ex.proc.stderr.read().decode(errors="replace")
-        if ex.proc.wait() != 0:
-            raise RuntimeError("ffmpeg failed: " + err.strip()[-400:])
-
-        project = self.load_project(pid)
-        previous = project.get("export") or {}
-        # re-exports overwrite the same file, so Stash updates the same scene
-        target = previous.get("path")
-        if not target:
-            safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", project.get("title") or "Parallax").strip()[:120]
-            target = os.path.join(self.media_dir, "Parallax", "%s [%s].mp4" % (safe or "Parallax", pid))
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.move(ex.path, target)
-        self.stash.scan([target])
-        sid = self.stash.find_by_path("scene", target)
-        if not sid:
-            raise RuntimeError("Stash did not import %s" % target)
-        self.apply_metadata(sid, project)
-        info = {"path": target, "scene_id": sid, "exported": time.time()}
-        write_json(self.project_path(pid, ".export.json"), info)
-        log("export %s -> scene %s (%s)" % (pid, sid, target))
-        return info
-
-    def apply_metadata(self, sid, project):
-        src = project["source"]
+    def apply_metadata(self, sid, project, src):
         if src["kind"] == "image":
             s = self.stash.gql("query($id: ID!) { findImage(id: $id) { title studio { id } performers { id } "
                                "galleries { title studio { id } performers { id } } } }",
@@ -700,6 +289,16 @@ class Parallax:
         if s.get("studio"):
             inp["studio_id"] = s["studio"]["id"]
         self.stash.gql("mutation($i: SceneUpdateInput!) { sceneUpdate(input: $i) { id } }", {"i": inp})
+
+    def file(self, rel):
+        """An Enhance Studio preview still (enhance-preview/...)."""
+        rel = urllib.parse.unquote(rel.split("?")[0])
+        path = os.path.realpath(os.path.join(self.root, rel))
+        if not path.startswith(os.path.realpath(os.path.join(self.root, "enhance-preview")) + os.sep) or not os.path.isfile(path):
+            raise KeyError("no such file")
+        with open(path, "rb") as f:
+            data = f.read()
+        return data, "image/jpeg"
 
     # ------------------------------------------------------------ AI jobs (frames, upscaling)
 
@@ -1174,14 +773,14 @@ class Parallax:
     # results go to <library>/Enhanced/<gallery or "Images">/ and are scanned in
     # with the originals' metadata, a gallery's into a new gallery.
 
-    def image_source(self, im):
-        """A path the service can read: the file itself, or a copy of an image
-        that lives inside a zip (fetched through Stash)."""
+    def image_source(self, im, folder=ENHANCE_SRC):
+        """A path a service can read: the file itself, or a copy (in folder) of an
+        image that lives inside a zip (fetched through Stash)."""
         if im["path"].lower().find(".zip" + os.sep) < 0:
             return im["path"]
-        os.makedirs(ENHANCE_SRC, exist_ok=True)
+        os.makedirs(folder, exist_ok=True)
         ext = os.path.splitext(im["path"])[1].lower() or ".jpg"
-        dst = os.path.join(ENHANCE_SRC, "%s%s" % (im["id"], ext))
+        dst = os.path.join(folder, "%s%s" % (im["id"], ext))
         if not os.path.exists(dst):
             base = self.stash.url[: -len("/graphql")]
             headers = {"ApiKey": self.stash.api_key} if self.stash.api_key else {}
@@ -1559,17 +1158,6 @@ class Parallax:
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         p = u.path[len("/parallax/"):]
         try:
-            if p == "status":
-                return 200, self.status(), None
-            if p == "projects":
-                return 200, self.summaries(q.get("source"), q.get("scene")), None
-            if p.startswith("project/"):
-                return 200, self.load_project(p[len("project/"):]), None
-            if p == "cuts":
-                return 200, self.cuts(q.get("source")), None
-            if p.startswith("job/"):
-                job = self.jobs.get(p[len("job/"):])
-                return (200, job, None) if job else (404, {"error": "no such job"}, None)
             if p == "fps":
                 return 200, self.fps_status(q.get("scene")), None
             if p == "upscale":
@@ -1584,9 +1172,18 @@ class Parallax:
                 # the studio is the enhance service's; Stash's CSP only lets the page reach this port
                 return 200, self.enhance_api("GET", "/" + p[len("enhance/"):], raw=True), \
                     "text/javascript" if p.endswith(".js") else "text/css"
-            if p.startswith("file/"):
+            if p.startswith("file/enhance-preview/"):
                 data, ctype = self.file(p[len("file/"):])
                 return 200, data, ctype
+            # Parallax Studio: the parallax service's
+            if p == "projects":
+                return 200, self.project_summaries(q), None
+            if p.startswith("ui/") and p[3:] in PARALLAX_UI:
+                return (200,) + self.parallax_api("GET", "/" + p, raw=True)
+            if p.startswith("file/"):
+                return (200,) + self.parallax_api("GET", "/" + p, raw=True)
+            if p in ("status", "cuts") or re.match(r"^(project|job)/[a-f0-9]{12}$", p):
+                return 200, self.parallax_api("GET", "/" + p + ("?" + u.query if u.query else "")), None
         except KeyError as e:
             return 404, {"error": str(e).strip("'")}, None
         except ValueError as e:
@@ -1615,36 +1212,19 @@ class Parallax:
                 return 200, fn[p.split("/")[1]](json.loads(raw or b"{}"))
             if p == "enhance/preview":
                 return 200, self.enhance_preview(json.loads(raw or b"{}"))
-            m = re.match(r"^export/([a-f0-9]{12})/(start|frames|finish|cancel)$", p)
-            if m and m.group(2) == "frames":
-                return 200, self.export_frames(m.group(1), raw)
-            body = json.loads(raw or b"{}")
-            if m:
-                pid, action = m.groups()
-                if action == "start":
-                    return 200, self.export_start(pid, body)
-                if action == "finish":
-                    return 200, self.export_finish(pid)
-                return 200, self.export_cancel(pid)
+            # Parallax Studio: the parallax service's
+            if p == "callback":
+                return 200, self.parallax_callback(json.loads(raw or b"{}"))
+            if re.match(r"^export/[a-f0-9]{12}/frames$", p):
+                return 200, self.parallax_api("POST", "/" + p, raw=raw)
             if p == "project":
-                if not self.status()["enabled"]:
-                    return 503, {"error": self.status()["reason"]}
-                return 200, self.create_project(body)
-            m = re.match(r"^project/([a-f0-9]{12})(/delete|/duplicate)?$", p)
-            if m:
-                if m.group(2) == "/delete":
-                    return 200, self.delete_project(m.group(1))
-                if m.group(2) == "/duplicate":
-                    return 200, self.duplicate_project(m.group(1))
-                return 200, self.save_project(m.group(1), body)
-            if p == "segment":
-                return 200, self.segment(body)
-            if p == "mask":
-                return 200, self.save_mask(body)
-            if p in ("cut", "extend"):
-                if not self.status()["enabled"]:
-                    return 503, {"error": self.status()["reason"]}
-                return 200, self.start_cut(body) if p == "cut" else self.start_extend(body)
+                return 200, self.create_project(json.loads(raw or b"{}"))
+            if p in ("source", "cut"):
+                body = json.loads(raw or b"{}")
+                return 200, self.parallax_api("POST", "/" + p, dict(body, source=self.stash_source(body.get("source"))))
+            if p in ("extend", "segment", "mask") or re.match(r"^(project/[a-f0-9]{12}(/delete|/duplicate)?|export/[a-f0-9]{12}/(start|finish|cancel))$", p):
+                # finishing waits for the service's callback to this side, which imports the video
+                return 200, self.parallax_api("POST", "/" + p, json.loads(raw or b"{}"), timeout=1000 if p.endswith("/finish") else 120)
         except KeyError as e:
             return 404, {"error": str(e).strip("'")}
         except ValueError as e:

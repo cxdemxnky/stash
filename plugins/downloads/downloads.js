@@ -460,7 +460,8 @@
     React.useEffect(() => {
       fetch(`${base}/parallax/projects`).then((r) => r.json()).then(setProjects, (e) => setError(e.message));
     }, [base]);
-    const src = (s) => (s.kind === "image" ? `Image ${s.id}` : `Scene ${s.id}${s.span ? " · bullet time" : ""}`);
+    // the downloader gives each project a link back to its still (meta.link) and its exported scene (scene_id)
+    const src = (p) => (p.meta && p.meta.link && p.meta.link.text) || (p.source && p.source.path ? p.source.path.replace(/^.*\//, "") : "?");
     return h(
       "div",
       null,
@@ -472,7 +473,7 @@
       (projects || []).map((p) =>
         h("div", { key: p.id, className: "dl-item" + (p.scene_id ? " dl-ai-done" : "") },
           h("div", { className: "dl-item-head" },
-            h("span", { className: "dl-kind" }, src(p.source)),
+            h("span", { className: "dl-kind" }, src(p)),
             h(Link, { className: "dl-title", to: `/parallax/${p.id}` }, p.title),
             p.scene_id ? h(Link, { to: `/scenes/${p.scene_id}`, className: "dl-ai-open" }, "Exported scene") : h("span", { className: "dl-when" }, "not exported"),
             h("span", { className: "dl-when" }, timeAgo(p.updated)))))
@@ -537,7 +538,7 @@
         h(Link, { className: "dl-title", to: `/parallax/${r.pid}` }, r.title || "Parallax project"),
         running && h("button", { className: "dl-top" + (armed ? " armed" : ""), onBlur: () => setArmed(false),
           onClick: () => (armed ? cancel(r.id) : setArmed(true)) }, armed ? "Click again to cancel" : "Cancel"),
-        r.stage === "done" && r.scene && h(Link, { to: `/scenes/${r.scene}`, className: "dl-ai-open" }, "Open the exported scene"),
+        r.stage === "done" && (r.link || r.scene) && h(Link, { to: r.link || `/scenes/${r.scene}`, className: "dl-ai-open" }, "Open the exported scene"),
         h("span", { className: "dl-when" }, timeAgo(Math.round((r.finished || r.updated || r.started) / 1000)))),
       running && h("div", { className: "dl-bar" }, h("div", { className: "dl-bar-fill" + (r.stage !== "Rendering" ? " indeterminate" : ""),
         style: { width: `${r.stage === "Rendering" ? Math.max(1, pct) : 100}%` } })),
@@ -562,7 +563,7 @@
       h("div", { className: "dl-tab-bar" },
         h("p", { className: "dl-empty" },
           "Parallax exports render in this browser while their studio is open (switching to this page in the same tab is fine), ",
-          "then the downloader encodes them and imports them into Stash. Renders from other browsers don't show here."),
+          "then the parallax service encodes them and the downloader imports them into Stash. Renders from other browsers don't show here."),
         h(CancelAllButton, { count: running.length, what: "running exports", onConfirm: () => running.forEach((r) => cancel(r.id)) })),
       !renders.length && h("p", { className: "dl-empty" }, "No exports yet."),
       renders.map((r) => h(RenderItem, { key: r.id, r, cancel }))
