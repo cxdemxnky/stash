@@ -101,7 +101,7 @@
     const RLink = (href, props, ...children) => h(Link, { to: href, ...props }, ...children);
     return {
       settingsKey: "enhance-studio-settings",
-      load: () => api(`enhance?scene=${sid}`),
+      load: () => api(`enhance?scene=${sid}`).then((d) => ({ ...d, video: d.scene })),
       queue: (b) => api("enhance", { scene_id: sid, settings: b.settings, label: b.label, summary: b.summary, estimate: b.estimate,
         ...(b.marker_id ? { marker_id: b.marker_id } : { start: b.start, duration: b.duration }) }),
       preview: (b) => api("enhance/preview", { scene_id: sid, time: b.time, settings: b.settings }).then(async (r) => {
@@ -110,7 +110,7 @@
       }),
       cancel: (job) => api(`fps/${job.id}/cancel`, {}),
       videoSrc: (info, direct) => {
-        const playable = direct && /^(h264|hevc|vp8|vp9|av1)$/i.test(info.scene.codec || "");
+        const playable = direct && /^(h264|hevc|vp8|vp9|av1)$/i.test(info.video.codec || "");
         return stashUrl(playable ? `scene/${sid}/stream` : `scene/${sid}/stream.mp4`);
       },
       frame: () => stashUrl(`scene/${sid}/screenshot`),
@@ -120,7 +120,7 @@
       queuesHref: "/queues?tab=enhance",
       jobSource: (job) => [`/enhance?scene=${job.scene_id}`, job.title],
       jobResult: (job) => job.scene ? RLink(`/scenes/${job.scene}`, { className: "enh-button enh-primary" }, "Open the new scene") : null,
-      savedAs: (info, label, part) => `${info.scene.file.replace(/\.[^.]+$/, "")}${part} [${label}].mp4`,
+      savedAs: (info, label, part) => `${info.video.file.replace(/\.[^.]+$/, "")}${part} [${label}].mp4`,
       queuedNote: "Queued. It's made as a new scene next to the original, with its metadata, tagged “Enhanced (AI)”. The original isn't changed.",
     };
   }

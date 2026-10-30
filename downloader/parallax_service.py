@@ -63,6 +63,7 @@ POST /parallax/enhance-image                  {image_id | gallery_id, only?, set
 POST /parallax/enhance-image/probe|preview|segment   {image_id, ...}: relayed to the service's /image/...
 POST /parallax/enhance                        {scene_id, marker_id? | start, duration, settings, label, summary,
                                               estimate} -> {job}
+POST /parallax/enhance/callback               {event, job}: the enhance service reporting a job (X-Token needed)
 POST /parallax/enhance/preview                {scene_id, time, settings} -> {before, after}: files for
                                               /parallax/file/, one frame through every step but the frame rate
 option is one of FPS_OPTIONS. The new video is written outside the library
@@ -89,6 +90,9 @@ UPSCALE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upsca
 INTERPOLATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpolate.py")
 ENHANCE_URL = os.environ.get("ENHANCE_URL", "http://127.0.0.1:10142").rstrip("/")  # the enhance service
 ENHANCE_TOKEN = os.environ.get("ENHANCE_TOKEN", "")  # from ~/.config/enhance/env (see the unit file)
+# where the service reports progress and finished jobs (this service; DOWNLOADER_TOKEN is how it gets in)
+ENHANCE_CALLBACK = os.environ.get("ENHANCE_CALLBACK_URL", "http://127.0.0.1:10141/parallax/enhance/callback")
+STASH_LINK = "http://{host}:10140"  # for the service's job list ("{host}": the host it's viewed from)
 ENHANCE_TAG = "Enhanced (AI)"
 SEGMENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segment.py")
 SEGMENT_MODELS = ("mobile_sam_image_encoder.onnx", "sam_mask_decoder_multi.onnx")
@@ -184,8 +188,9 @@ class Parallax:
         self.fps_proc = None
         self.load_ai_jobs()
         threading.Thread(target=self.run_fps, daemon=True).start()
-        self.enhance_wake = threading.Event()  # Enhance Studio jobs run in the enhance service
-        threading.Thread(target=self.enhance_sync, daemon=True).start()
+        # Enhance Studio jobs run in the enhance service, which calls back (enhance_callback)
+        self.enhance_lock = threading.Lock()
+        threading.Thread(target=self.enhance_reconcile, daemon=True).start()
         # click-to-select: one long-lived worker, so clicks don't each load the model
         self.seg_proc = None
         self.seg_lock = threading.Lock()
@@ -712,7 +717,7 @@ class Parallax:
     def load_ai_jobs(self):
         for job in read_json(self.ai_jobs_path(), []) or []:
             if job.get("kind") in ("enhance", "enhance-image"):
-                pass  # run by the enhance service; enhance_sync picks them up again
+                pass  # run by the enhance service, which calls back when they finish
             elif job["state"] in ("queued", "running", "cancelling"):
                 if job["state"] == "cancelling":
                     job["state"] = "cancelled"
@@ -967,7 +972,7 @@ class Parallax:
     # API at ENHANCE_URL). This side finds the scene's file, names the new one, and
     # when the service has made it, scans it in with the scene's metadata. Each
     # service job is mirrored in fps_jobs (kind "enhance", the service's id) so the
-    # Queues page lists it with the other AI jobs; enhance_sync keeps it current.
+    # Queues page lists it with the other AI jobs; the service's callbacks keep it current.
 
     def enhance_api(self, method, path, body=None, raw=False, timeout=30):
         req = urllib.request.Request(ENHANCE_URL + path, method=method,
@@ -1068,8 +1073,9 @@ class Parallax:
         summary = str(body.get("summary") or "")[:2000]
         remote = self.enhance_api("POST", "/jobs", {
             "input": f["path"], "output": "%s [%s].mp4" % (stem, label), "settings": settings, "start": start,
-            "duration": dur, "estimate": estimate, "meta": {"client": "stash", "scene_id": sid, "label": label,
-                                                            "title": scene["title"] + part, "summary": summary}}, timeout=180)
+            "duration": dur, "estimate": estimate, "callback": self.callback(),
+            "meta": {"client": "stash", "scene_id": sid, "label": label, "title": scene["title"] + part, "summary": summary,
+                     "link": {"href": "%s/scenes/%s" % (STASH_LINK, sid), "text": "%s (Stash)" % (scene["title"] + part)}}}, timeout=180)
         if remote["id"] in self.fps_jobs:  # the same job again (a double click)
             return {"job": remote["id"]}
         job = {"id": remote["id"], "kind": "enhance", "scene_id": sid, "option": "enhance",
@@ -1080,50 +1086,62 @@ class Parallax:
         with self.fps_cond:
             self.fps_jobs[job["id"]] = job
         self.save_ai_jobs()
-        self.enhance_wake.set()
         log("enhance (%s) queued for scene %s%s: service job %s" % (label, sid, part, job["id"]))
         return {"job": job["id"]}
 
-    def enhance_sync(self):
-        """Copies the service's progress into the mirrored jobs, and imports
-        each finished video into Stash (also ones finished while this was down)."""
-        while True:
+    @staticmethod
+    def callback():
+        return {"url": ENHANCE_CALLBACK, "headers": {"X-Token": os.environ.get("DOWNLOADER_TOKEN", "")}}
+
+    def enhance_callback(self, body):
+        """POST /parallax/enhance/callback, from the enhance service: {"event":
+        "started" | "progress" | "finished", "job"}. Progress goes into the
+        mirrored job; a finished job's files are scanned in with their source's
+        metadata and tagged before this answers. The service retries "finished"
+        until it gets an answer, so it's handled once (later ones are no-ops)."""
+        r = body.get("job") or {}
+        j = self.fps_jobs.get(str(r.get("id")))
+        if not j or j.get("kind") not in ("enhance", "enhance-image"):
+            raise KeyError("no such job")  # 404: the service stops retrying
+        event = body.get("event")
+        with self.enhance_lock:
+            if j["state"] in ("done", "error", "cancelled") and not j.get("importing"):
+                return {"ok": True, "state": j["state"]}
+            for k in ("progress", "frames", "total", "speed", "eta", "started"):
+                if k in r:
+                    j[k] = r[k]
+            if r.get("result"):
+                j["output"] = r["result"]
+            if event == "finished":
+                if r.get("state") == "done":
+                    (self.enhance_image_import if j["kind"] == "enhance-image" else self.enhance_import)(j, r)
+                else:
+                    j.update(state=r.get("state") or "error", error=r.get("error"), finished=r.get("finished"))
+                self.save_ai_jobs()
+            elif j["state"] != "cancelling":
+                j["state"] = "running" if event in ("started", "progress") else j["state"]
+                if event == "started":
+                    self.save_ai_jobs()
+        return {"ok": True, "state": j["state"]}
+
+    def enhance_reconcile(self):
+        """At start: jobs this mirrors that the service no longer has (its data
+        was wiped) can never call back, so they're marked failed."""
+        for _ in range(60):
             active = [j for j in list(self.fps_jobs.values())
                       if j.get("kind") in ("enhance", "enhance-image") and j["state"] in ("queued", "running", "cancelling")]
             if not active:
-                self.enhance_wake.wait(60)
-                self.enhance_wake.clear()
-                continue
+                return
             try:
-                remote = {r["id"]: r for r in self.enhance_api("GET", "/jobs?ids=" + ",".join(j["id"] for j in active))}
-            except ValueError as e:  # the service is down: try again later
-                for j in active:
-                    j["service_error"] = str(e)
-                time.sleep(10)
+                known = {r["id"] for r in self.enhance_api("GET", "/jobs?limit=1000&ids=" + ",".join(j["id"] for j in active))}
+            except ValueError:
+                time.sleep(10)  # the service isn't up yet
                 continue
-            changed = False
             for j in active:
-                r = remote.get(j["id"])
-                j.pop("service_error", None)
-                if not r:
+                if j["id"] not in known:
                     j.update(state="error", error="the enhance service has no record of this job")
-                    changed = True
-                    continue
-                before = j["state"]
-                for k in ("progress", "frames", "total", "speed", "eta", "started"):
-                    j[k] = r.get(k)
-                if r.get("result"):
-                    j["output"] = r["result"]
-                if r["state"] == "done":
-                    (self.enhance_image_import if j["kind"] == "enhance-image" else self.enhance_import)(j, r)
-                elif r["state"] in ("error", "cancelled"):
-                    j.update(state=r["state"], error=r.get("error"), finished=r.get("finished"))
-                elif j["state"] != "cancelling" or r["state"] == "cancelling":
-                    j["state"] = r["state"]
-                changed |= j["state"] != before
-            if changed:
-                self.save_ai_jobs()
-            time.sleep(2)
+            self.save_ai_jobs()
+            return
 
     def enhance_import(self, job, remote):
         target = remote["output_path"]
@@ -1149,7 +1167,6 @@ class Parallax:
         r = self.enhance_api("POST", "/jobs/%s/cancel" % job["id"])
         job["state"] = "cancelled" if r["state"] == "cancelled" else "cancelling"
         self.save_ai_jobs()
-        self.enhance_wake.set()
         return {"cancelled": job["id"]}
 
     # ------------------------------------------------------------ the image studio
@@ -1259,9 +1276,10 @@ class Parallax:
         summary = str(body.get("summary") or "")[:2000]
         estimate = int(body.get("estimate") or 0) or None
         remote = self.enhance_api("POST", "/jobs", {
-            "kind": "image", "items": items, "settings": settings, "estimate": estimate,
+            "kind": "image", "items": items, "settings": settings, "estimate": estimate, "callback": self.callback(),
             "meta": {"client": "stash", "image_id": image_id, "gallery_id": gallery_id, "label": label, "title": title,
-                     "summary": summary}}, timeout=600)
+                     "summary": summary, "link": {"href": "%s/%s" % (STASH_LINK, "galleries/" + gallery_id if gallery_id else "images/" + image_id),
+                                                  "text": "%s (Stash)" % title}}}, timeout=600)
         if remote["id"] in self.fps_jobs:
             return {"job": remote["id"]}
         job = {"id": remote["id"], "kind": "enhance-image", "image_id": image_id, "gallery_id": gallery_id, "only": only,
@@ -1272,7 +1290,6 @@ class Parallax:
         with self.fps_cond:
             self.fps_jobs[job["id"]] = job
         self.save_ai_jobs()
-        self.enhance_wake.set()
         log("enhance images (%s) queued: %s %s, %d images: service job %s" % (
             label, "gallery" if gallery_id else "image", gallery_id or image_id, len(imgs), job["id"]))
         return {"job": job["id"]}
@@ -1591,6 +1608,8 @@ class Parallax:
                 return 200, self.start_enhance(json.loads(raw or b"{}"))
             if p == "enhance-image":
                 return 200, self.start_enhance_image(json.loads(raw or b"{}"))
+            if p == "enhance/callback":
+                return 200, self.enhance_callback(json.loads(raw or b"{}"))
             if p in ("enhance-image/probe", "enhance-image/preview", "enhance-image/segment"):
                 fn = {"probe": self.enhance_image_probe, "preview": self.enhance_image_preview, "segment": self.enhance_image_segment}
                 return 200, fn[p.split("/")[1]](json.loads(raw or b"{}"))
