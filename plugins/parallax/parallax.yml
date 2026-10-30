@@ -6,6 +6,7 @@ ui:
     - render.js
     - studio.js
     - buttons.js
+    - enhance.js
   css:
     - parallax.css
   csp:

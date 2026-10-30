@@ -48,6 +48,23 @@ POST /parallax/fps/<job>/cancel                 (also cancels upscale jobs: same
 GET  /parallax/upscale?image=ID|gallery=ID    {jobs, estimate: {images, seconds: {"2", "4"}}, available}
 POST /parallax/upscale                        {image_id | gallery_id, factor 2|4} -> {job}
 GET  /parallax/ai-jobs                        every AI job, newest first (kept across restarts)
+
+Enhance Studio (/enhance in Stash): deinterlace (QTGMC/BWDIF) -> crop -> denoise
+and clean-ups -> upscale (Real-ESRGAN or Lanczos) -> frame rate (RIFE) -> encode,
+done by the enhance service (/media/matt/WD/tmp/enhance, ENHANCE_URL) with its own
+queue; this side picks the file, then scans the result in and copies the metadata.
+GET  /parallax/enhance?scene=ID               {scene, markers, jobs, available, speeds, calibration, queued,
+                                              service_error}
+GET  /parallax/enhance/ui/studio.js|studio.css|image-studio.js   the shared studios, relayed from the enhance service
+Image studio (/enhance-image in Stash; replaces the old Upscale buttons), made by the service too:
+GET  /parallax/enhance-image?image=ID|gallery=ID  {title, images, jobs, available, speeds, calibration, queued, service_error}
+POST /parallax/enhance-image                  {image_id | gallery_id, only?, settings, masks: {image id: PNG data URL},
+                                              label, summary, estimate} -> {job}: new images in <library>/Enhanced/
+POST /parallax/enhance-image/probe|preview|segment   {image_id, ...}: relayed to the service's /image/...
+POST /parallax/enhance                        {scene_id, marker_id? | start, duration, settings, label, summary,
+                                              estimate} -> {job}
+POST /parallax/enhance/preview                {scene_id, time, settings} -> {before, after}: files for
+                                              /parallax/file/, one frame through every step but the frame rate
 option is one of FPS_OPTIONS. The new video is written outside the library
 (FPS_WORK), then moved next to the original, scanned in as a new scene with the
 original's metadata, and tagged. The original is never changed.
@@ -62,12 +79,17 @@ import subprocess
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
 PARALLAX_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parallax.py")
 UPSCALE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upscale.py")
 INTERPOLATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpolate.py")
+ENHANCE_URL = os.environ.get("ENHANCE_URL", "http://127.0.0.1:10142").rstrip("/")  # the enhance service
+ENHANCE_TOKEN = os.environ.get("ENHANCE_TOKEN", "")  # from ~/.config/enhance/env (see the unit file)
+ENHANCE_TAG = "Enhanced (AI)"
 SEGMENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segment.py")
 SEGMENT_MODELS = ("mobile_sam_image_encoder.onnx", "sam_mask_decoder_multi.onnx")
 SEGMENT_IDLE = 300  # seconds without clicks before the segment worker (and its GPU memory) goes
@@ -85,6 +107,8 @@ FPS_WORK = "/media/matt/WD/tmp/.fps-work"  # on the media disk (big files), outs
 MARKER_SECONDS = 10  # length of a marker's clip when it has no end time
 UPSCALE_TAG = "Upscaled (AI)"
 UPSCALE_DIR = "Upscaled"  # folder in the library for upscaled images
+ENHANCED_DIR = "Enhanced"  # folder in the library for images made in the image studio
+ENHANCE_SRC = os.path.join(FPS_WORK, "enhance-src")  # copies of images inside zips (the service can't read zips)
 UPSCALE_SPEED = 0.95  # default source megapixels upscaled per second (video frames, 2x; 1080p ~0.47 frame/s)
 IMAGE_SPEED = 0.7  # default source megapixels per second for images (plus IMAGE_OVERHEAD each)
 IMAGE_OVERHEAD = 0.6
@@ -160,6 +184,8 @@ class Parallax:
         self.fps_proc = None
         self.load_ai_jobs()
         threading.Thread(target=self.run_fps, daemon=True).start()
+        self.enhance_wake = threading.Event()  # Enhance Studio jobs run in the enhance service
+        threading.Thread(target=self.enhance_sync, daemon=True).start()
         # click-to-select: one long-lived worker, so clicks don't each load the model
         self.seg_proc = None
         self.seg_lock = threading.Lock()
@@ -685,7 +711,9 @@ class Parallax:
 
     def load_ai_jobs(self):
         for job in read_json(self.ai_jobs_path(), []) or []:
-            if job["state"] in ("queued", "running", "cancelling"):
+            if job.get("kind") in ("enhance", "enhance-image"):
+                pass  # run by the enhance service; enhance_sync picks them up again
+            elif job["state"] in ("queued", "running", "cancelling"):
                 if job["state"] == "cancelling":
                     job["state"] = "cancelled"
                 else:
@@ -694,8 +722,13 @@ class Parallax:
             self.fps_jobs[job["id"]] = job
         if os.path.isdir(FPS_WORK):
             for name in os.listdir(FPS_WORK):
-                shutil.rmtree(os.path.join(FPS_WORK, name), ignore_errors=True) if os.path.isdir(os.path.join(FPS_WORK, name)) \
-                    else os.remove(os.path.join(FPS_WORK, name))
+                path = os.path.join(FPS_WORK, name)
+                if path == ENHANCE_SRC:  # zip images queued for the enhance service: kept for a week
+                    for f in os.listdir(path):
+                        if time.time() - os.path.getmtime(os.path.join(path, f)) > 7 * 86400:
+                            os.remove(os.path.join(path, f))
+                    continue
+                shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
         if self.fps_queue:
             log("AI jobs: %d queued again after a restart" % len(self.fps_queue))
 
@@ -799,6 +832,8 @@ class Parallax:
         job = self.fps_jobs.get(jid)
         if not job:
             raise KeyError("no such job")
+        if job.get("kind") in ("enhance", "enhance-image"):
+            return self.cancel_enhance(job)
         with self.fps_cond:
             if job["state"] == "queued":
                 self.fps_queue.remove(jid)
@@ -806,7 +841,10 @@ class Parallax:
             elif job["state"] == "running":
                 job.update(state="cancelling")
                 if self.fps_proc:
-                    self.fps_proc.kill()
+                    try:
+                        self.fps_proc.kill()
+                    except OSError:
+                        pass
         self.save_ai_jobs()
         return {"cancelled": jid}
 
@@ -819,7 +857,7 @@ class Parallax:
             job["state"] = "running"
             self.save_ai_jobs()
             try:
-                self.upscale_images(job) if job.get("kind") == "upscale" else self.double_fps(job)
+                (self.upscale_images if job.get("kind") == "upscale" else self.double_fps)(job)
             except Exception as e:
                 if job["state"] == "cancelling":
                     job.update(state="cancelled")
@@ -892,7 +930,7 @@ class Parallax:
         job.update(state="done", progress=1, scene=new, finished=time.time())
         log("AI frames (%s): scene %s -> %s (%s)" % (job["option"], job["scene_id"], new, target))
 
-    def copy_scene_metadata(self, sid, new, title_sfx, tag_name, option, marker=None):
+    def copy_scene_metadata(self, sid, new, title_sfx, tag_name, option, marker=None, what=None):
         s = self.stash.gql(
             "query($id: ID!) { findScene(id: $id) { title details date code rating100 studio { id } performers { id } tags { id } } }",
             {"id": sid})["findScene"]
@@ -901,7 +939,7 @@ class Parallax:
             tags.append(self.stash.ensure("tag", tag_name))
         what = {"clip": "", "smooth2": "AI frame-rate doubling (RIFE)", "slowmo2": "AI slow motion 2× (RIFE)",
                 "slowmo4": "AI slow motion 4× (RIFE)", "upscale2": "AI upscale 2× (Real-ESRGAN)",
-                "upscale4k": "AI upscale to 4K (Real-ESRGAN, one 4× pass)"}[option]
+                "upscale4k": "AI upscale to 4K (Real-ESRGAN, one 4× pass)"}.get(option, "") if what is None else what
         title = s["title"] or "Scene %s" % sid
         if marker:
             title += " – " + marker["title"]
@@ -923,6 +961,399 @@ class Parallax:
         if s.get("studio"):
             inp["studio_id"] = s["studio"]["id"]
         self.stash.gql("mutation($i: SceneUpdateInput!) { sceneUpdate(input: $i) { id } }", {"i": inp})
+
+    # ------------------------------------------------------------ Enhance Studio
+    # The work is done by the enhance service (/media/matt/WD/tmp/enhance, its own
+    # API at ENHANCE_URL). This side finds the scene's file, names the new one, and
+    # when the service has made it, scans it in with the scene's metadata. Each
+    # service job is mirrored in fps_jobs (kind "enhance", the service's id) so the
+    # Queues page lists it with the other AI jobs; enhance_sync keeps it current.
+
+    def enhance_api(self, method, path, body=None, raw=False, timeout=30):
+        req = urllib.request.Request(ENHANCE_URL + path, method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"X-Token": ENHANCE_TOKEN, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read())["error"]
+            except (ValueError, KeyError, OSError):
+                msg = "enhance service: HTTP %d" % e.code
+            raise KeyError(msg) if e.code == 404 else ValueError(msg)
+        except OSError as e:
+            raise ValueError("the enhance service isn't running at %s (systemctl --user start enhance): %s"
+                             % (ENHANCE_URL, getattr(e, "reason", e)))
+        return data if raw else json.loads(data)
+
+    def enhance_scene_info(self, sid):
+        sc = self.stash.gql(
+            "query($id: ID!) { findScene(id: $id) { id title "
+            "files { path duration frame_rate width height video_codec bit_rate size } "
+            "scene_markers { id title seconds end_seconds primary_tag { id name } tags { id name } } } }",
+            {"id": str(int(sid))})["findScene"]
+        if not sc or not sc["files"]:
+            raise KeyError("no such scene")
+        f = sc["files"][0]
+        if f["path"].lower().find(".zip" + os.sep) >= 0:
+            raise ValueError("this scene's file is inside a zip")
+        markers = []
+        for m in sorted(sc.get("scene_markers") or [], key=lambda m: m["seconds"]):
+            end = m["end_seconds"] if m.get("end_seconds") and m["end_seconds"] > m["seconds"] else m["seconds"] + MARKER_SECONDS
+            end = min(end, f["duration"] or end)
+            markers.append({"id": m["id"], "title": m["title"] or m["primary_tag"]["name"], "start": m["seconds"],
+                            "duration": round(max(0.1, end - m["seconds"]), 3), "has_end": bool(m.get("end_seconds")),
+                            "tag_ids": [m["primary_tag"]["id"]] + [x["id"] for x in m["tags"]]})
+        return sc, f, {"id": sc["id"], "title": sc["title"] or os.path.basename(f["path"]), "path": f["path"],
+                       "file": os.path.basename(f["path"]), "width": f["width"], "height": f["height"],
+                       "fps": f["frame_rate"] or 30, "duration": f["duration"] or 0, "codec": f["video_codec"],
+                       "bit_rate": f["bit_rate"], "size": f["size"], "sar": "1:1", "interlace": None,
+                       "duplicates": None}, markers
+
+    def enhance_status(self, sid):
+        sc, f, scene, markers = self.enhance_scene_info(sid)
+        jobs = sorted((j for j in self.fps_jobs.values() if j.get("kind") == "enhance" and j["scene_id"] == scene["id"]),
+                      key=lambda j: j["created"], reverse=True)
+        res = {"scene": scene, "markers": markers, "jobs": jobs[:20], "queued": 0, "service_error": None,
+               "available": {"vs": False, "rife": False, "upscale": False}, "speeds": {}, "calibration": 1.0}
+        try:
+            st = self.enhance_api("GET", "/status")
+            self.enhance_last = st  # its speeds keep the estimates sensible while it's down
+            res.update(available=st["available"], speeds=st["speeds"], calibration=st["calibration"],
+                       queued=st["queued"] + (1 if st["running"] else 0))
+            info = self.enhance_api("POST", "/probe", {"path": f["path"]}, timeout=180)
+            scene.update(sar=info["sar"], interlace=info["interlace"], duplicates=info.get("duplicates"))
+        except ValueError as e:
+            res["service_error"] = str(e)
+            last = getattr(self, "enhance_last", None)
+            if last:
+                res.update(speeds=last["speeds"], calibration=last["calibration"])
+        return res
+
+    def enhance_range(self, body, f, markers):
+        """(start, duration, marker or None) of the part to process."""
+        if body.get("marker_id"):
+            m = next((m for m in markers if m["id"] == str(body["marker_id"])), None)
+            if not m:
+                raise KeyError("no such marker")
+            return m["start"], m["duration"], m
+        start = max(0.0, float(body.get("start") or 0))
+        dur = max(0.0, float(body.get("duration") or 0))
+        total = f["duration"] or 0
+        if total and start >= total:
+            raise ValueError("the start is past the end of the video")
+        if dur and total:
+            dur = min(dur, total - start)
+        return start, dur, None
+
+    def start_enhance(self, body):
+        sid = str(int(body.get("scene_id")))
+        settings = body.get("settings") or {}
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+        sc, f, scene, markers = self.enhance_scene_info(sid)
+        start, dur, marker = self.enhance_range(body, f, markers)
+        label = re.sub(r"[^\w .,×+-]+", "", str(body.get("label") or "enhanced"))[:48].strip() or "enhanced"
+        stem, _ = os.path.splitext(f["path"])
+        if marker:  # "<file> [<marker> 1m23s] [enhanced …].mp4", next to the original
+            safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\[\]]+', " ", marker["title"]).strip()[:60] or "marker"
+            stem = "%s [%s %dm%02ds]" % (stem, safe, *divmod(int(marker["start"]), 60))
+        elif start or dur:
+            stem = "%s [%dm%02ds]" % (stem, *divmod(int(start), 60))
+        estimate = int(body.get("estimate") or 0) or None
+        length = dur or max(0.0, (f["duration"] or 0) - start)
+        part = "" if not (start or dur) else " – " + (marker["title"] if marker else "%d:%02d–%d:%02d" % (
+            start // 60, start % 60, (start + length) // 60, (start + length) % 60))
+        summary = str(body.get("summary") or "")[:2000]
+        remote = self.enhance_api("POST", "/jobs", {
+            "input": f["path"], "output": "%s [%s].mp4" % (stem, label), "settings": settings, "start": start,
+            "duration": dur, "estimate": estimate, "meta": {"client": "stash", "scene_id": sid, "label": label,
+                                                            "title": scene["title"] + part, "summary": summary}}, timeout=180)
+        if remote["id"] in self.fps_jobs:  # the same job again (a double click)
+            return {"job": remote["id"]}
+        job = {"id": remote["id"], "kind": "enhance", "scene_id": sid, "option": "enhance",
+               "marker_id": marker and marker["id"], "marker": marker, "start": start, "duration": dur,
+               "settings": settings, "label": label, "summary": summary,
+               "title": scene["title"] + part, "state": "queued", "progress": 0, "frames": 0, "total": remote["total"],
+               "speed": None, "eta": estimate, "estimate": estimate, "error": None, "scene": None, "created": time.time()}
+        with self.fps_cond:
+            self.fps_jobs[job["id"]] = job
+        self.save_ai_jobs()
+        self.enhance_wake.set()
+        log("enhance (%s) queued for scene %s%s: service job %s" % (label, sid, part, job["id"]))
+        return {"job": job["id"]}
+
+    def enhance_sync(self):
+        """Copies the service's progress into the mirrored jobs, and imports
+        each finished video into Stash (also ones finished while this was down)."""
+        while True:
+            active = [j for j in list(self.fps_jobs.values())
+                      if j.get("kind") in ("enhance", "enhance-image") and j["state"] in ("queued", "running", "cancelling")]
+            if not active:
+                self.enhance_wake.wait(60)
+                self.enhance_wake.clear()
+                continue
+            try:
+                remote = {r["id"]: r for r in self.enhance_api("GET", "/jobs?ids=" + ",".join(j["id"] for j in active))}
+            except ValueError as e:  # the service is down: try again later
+                for j in active:
+                    j["service_error"] = str(e)
+                time.sleep(10)
+                continue
+            changed = False
+            for j in active:
+                r = remote.get(j["id"])
+                j.pop("service_error", None)
+                if not r:
+                    j.update(state="error", error="the enhance service has no record of this job")
+                    changed = True
+                    continue
+                before = j["state"]
+                for k in ("progress", "frames", "total", "speed", "eta", "started"):
+                    j[k] = r.get(k)
+                if r.get("result"):
+                    j["output"] = r["result"]
+                if r["state"] == "done":
+                    (self.enhance_image_import if j["kind"] == "enhance-image" else self.enhance_import)(j, r)
+                elif r["state"] in ("error", "cancelled"):
+                    j.update(state=r["state"], error=r.get("error"), finished=r.get("finished"))
+                elif j["state"] != "cancelling" or r["state"] == "cancelling":
+                    j["state"] = r["state"]
+                changed |= j["state"] != before
+            if changed:
+                self.save_ai_jobs()
+            time.sleep(2)
+
+    def enhance_import(self, job, remote):
+        target = remote["output_path"]
+        job.update(state="running", progress=0.99, importing=True)
+        try:
+            self.stash.scan([target])
+            new = self.stash.find_by_path("scene", target)
+            if not new:
+                raise RuntimeError("Stash did not import %s" % target)
+            what = "Enhance Studio (%s): %s" % (job["label"], (job.get("summary") or "").rstrip(". ") or job["label"])
+            if not job.get("marker") and (job.get("start") or job.get("duration")):
+                what += " (from %d:%02d)" % divmod(int(job.get("start") or 0), 60)
+            self.copy_scene_metadata(job["scene_id"], new, "(%s)" % job["label"], ENHANCE_TAG, "enhance",
+                                     job.get("marker"), what=what)
+            job.update(state="done", progress=1, scene=new, path=target, finished=remote.get("finished") or time.time())
+            log("enhance (%s): scene %s -> %s (%s)" % (job["label"], job["scene_id"], new, target))
+        except Exception as e:
+            traceback.print_exc()
+            job.update(state="error", error="made %s, but importing it failed: %s" % (os.path.basename(target), e))
+        job.pop("importing", None)
+
+    def cancel_enhance(self, job):
+        r = self.enhance_api("POST", "/jobs/%s/cancel" % job["id"])
+        job["state"] = "cancelled" if r["state"] == "cancelled" else "cancelling"
+        self.save_ai_jobs()
+        self.enhance_wake.set()
+        return {"cancelled": job["id"]}
+
+    # ------------------------------------------------------------ the image studio
+    # (/enhance-image?image=ID|gallery=ID). Made by the enhance service too; the
+    # results go to <library>/Enhanced/<gallery or "Images">/ and are scanned in
+    # with the originals' metadata, a gallery's into a new gallery.
+
+    def image_source(self, im):
+        """A path the service can read: the file itself, or a copy of an image
+        that lives inside a zip (fetched through Stash)."""
+        if im["path"].lower().find(".zip" + os.sep) < 0:
+            return im["path"]
+        os.makedirs(ENHANCE_SRC, exist_ok=True)
+        ext = os.path.splitext(im["path"])[1].lower() or ".jpg"
+        dst = os.path.join(ENHANCE_SRC, "%s%s" % (im["id"], ext))
+        if not os.path.exists(dst):
+            base = self.stash.url[: -len("/graphql")]
+            headers = {"ApiKey": self.stash.api_key} if self.stash.api_key else {}
+            with self.http_request("%s/image/%s/image" % (base, im["id"]), headers) as r, open(dst + ".part", "wb") as f:
+                shutil.copyfileobj(r, f)
+            os.replace(dst + ".part", dst)
+        return dst
+
+    def image_by_id(self, image_id):
+        imgs, _ = self.upscale_targets(image_id=str(int(image_id)))
+        if not imgs:
+            raise KeyError("no such image")
+        return imgs[0]
+
+    def enhance_image_status(self, q):
+        imgs, g = self.upscale_targets(image_id=q.get("image"), gallery_id=q.get("gallery"))
+        key = ("gallery_id", q.get("gallery")) if q.get("gallery") else ("image_id", q.get("image"))
+        jobs = sorted((j for j in self.fps_jobs.values() if j.get("kind") == "enhance-image" and j.get(key[0]) == key[1]),
+                      key=lambda j: j["created"], reverse=True)
+        res = {"title": (g["title"] if g else imgs[0]["title"] if imgs else "") or "",
+               "images": [{"key": i["id"], "name": os.path.basename(i["path"]), "width": i["width"], "height": i["height"]} for i in imgs],
+               "jobs": jobs[:10], "queued": 0, "service_error": None, "available": {}, "speeds": {}, "calibration": 1.0}
+        try:
+            st = self.enhance_api("GET", "/status")
+            self.enhance_last = st
+            res.update(available=st["images"]["available"], speeds=st["images"]["speeds"], calibration=st["images"]["calibration"],
+                       queued=st["queued"] + (1 if st["running"] else 0))
+        except ValueError as e:
+            res["service_error"] = str(e)
+            last = getattr(self, "enhance_last", None)
+            if last and "images" in last:
+                res.update(speeds=last["images"]["speeds"], calibration=last["images"]["calibration"])
+        return res
+
+    def enhance_image_probe(self, body):
+        return self.enhance_api("POST", "/image/probe", {"path": self.image_source(self.image_by_id(body.get("image_id")))}, timeout=180)
+
+    def enhance_image_segment(self, body):
+        return self.enhance_api("POST", "/image/segment", {"input": self.image_source(self.image_by_id(body.get("image_id"))),
+                                                           "points": body.get("points") or []}, timeout=300)
+
+    def enhance_image_preview(self, body):
+        im = self.image_by_id(body.get("image_id"))
+        r = self.enhance_api("POST", "/image/preview", {"input": self.image_source(im), "settings": body.get("settings") or {},
+                                                        "mask": body.get("mask")}, timeout=900)
+        out = os.path.join(self.root, "enhance-preview", "img-%s" % im["id"])
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        names = {}
+        for k in ("before", "after"):
+            name = os.path.basename(r[k].split("?")[0])
+            with open(os.path.join(out, name), "wb") as fh:
+                fh.write(self.enhance_api("GET", r[k], raw=True))
+            names[k] = "enhance-preview/img-%s/%s?v=%d" % (im["id"], name, int(time.time()))
+        return dict(r, **names)
+
+    @staticmethod
+    def image_out_ext(path, settings):
+        fmt = (settings.get("output") or {}).get("format", "keep")
+        src = os.path.splitext(path)[1].lower().lstrip(".")
+        ext = {"jpeg": "jpg", "jpg": "jpg", "png": "png", "webp": "webp"}.get(src, "png") if fmt == "keep" else fmt
+        bg = settings.get("background") or {}
+        if bg.get("on") and bg.get("mode") == "remove" and ext == "jpg":
+            ext = "png"  # JPEG can't be transparent
+        return ext if ext in ("jpg", "png", "webp") else "png"
+
+    def start_enhance_image(self, body):
+        image_id = str(int(body["image_id"])) if body.get("image_id") else None
+        gallery_id = str(int(body["gallery_id"])) if body.get("gallery_id") else None
+        if not image_id and not gallery_id:
+            raise ValueError("image_id or gallery_id needed")
+        settings = body.get("settings") or {}
+        masks = body.get("masks") or {}
+        imgs, g = self.upscale_targets(image_id, gallery_id)
+        only = str(body["only"]) if body.get("only") else None
+        if only:
+            imgs = [i for i in imgs if i["id"] == only]
+        if not imgs:
+            raise ValueError("no images")
+        label = re.sub(r"[^\w .,×+-]+", "", str(body.get("label") or "enhanced"))[:48].strip() or "enhanced"
+        title = (g["title"] if g else imgs[0]["title"]) or os.path.basename(imgs[0]["path"])
+        if g and only:
+            title += " – " + (imgs[0]["title"] or os.path.basename(imgs[0]["path"]))
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", title).strip()[:80] or "Images"
+        folder = os.path.join(self.media_dir, ENHANCED_DIR, "%s [%s]" % (name, label) if g and not only else "Images")
+        os.makedirs(folder, exist_ok=True)
+        items = []
+        for im in imgs:
+            stem = os.path.splitext(os.path.basename(im["path"]))[0]
+            items.append({"input": self.image_source(im), "mask": masks.get(im["id"]),
+                          "output": os.path.join(folder, "%s [%s].%s" % (stem, label, self.image_out_ext(im["path"], settings)))})
+        summary = str(body.get("summary") or "")[:2000]
+        estimate = int(body.get("estimate") or 0) or None
+        remote = self.enhance_api("POST", "/jobs", {
+            "kind": "image", "items": items, "settings": settings, "estimate": estimate,
+            "meta": {"client": "stash", "image_id": image_id, "gallery_id": gallery_id, "label": label, "title": title,
+                     "summary": summary}}, timeout=600)
+        if remote["id"] in self.fps_jobs:
+            return {"job": remote["id"]}
+        job = {"id": remote["id"], "kind": "enhance-image", "image_id": image_id, "gallery_id": gallery_id, "only": only,
+               "scene_id": None, "option": "enhance-image", "marker_id": None, "marker": None,
+               "image_ids": [i["id"] for i in imgs], "folder": folder, "label": label, "summary": summary, "title": title,
+               "state": "queued", "progress": 0, "frames": 0, "total": len(imgs), "speed": None, "eta": estimate,
+               "estimate": estimate, "error": None, "image": None, "gallery": None, "created": time.time()}
+        with self.fps_cond:
+            self.fps_jobs[job["id"]] = job
+        self.save_ai_jobs()
+        self.enhance_wake.set()
+        log("enhance images (%s) queued: %s %s, %d images: service job %s" % (
+            label, "gallery" if gallery_id else "image", gallery_id or image_id, len(imgs), job["id"]))
+        return {"job": job["id"]}
+
+    def enhance_image_import(self, job, remote):
+        """Scan the new images in with the originals' metadata (images often only
+        get performers and studio through their gallery), tagged ENHANCE_TAG; a
+        whole gallery's go into a new gallery "<title> (<label>)"."""
+        job.update(state="running", progress=0.99, importing=True)
+        try:
+            outs = remote.get("output_paths") or []
+            self.stash.scan([job["folder"]])
+            tag = self.stash.ensure("tag", ENHANCE_TAG)
+            note = "Enhance Studio (%s): %s" % (job["label"], (job.get("summary") or "").rstrip(". ") or job["label"])
+            new_gallery = None
+            if job.get("gallery_id") and not job.get("only"):
+                gm = self.stash.gql("query($id: ID!) { findGallery(id: $id) { title date details photographer studio { id } "
+                                    "performers { id } tags { id } } }", {"id": job["gallery_id"]})["findGallery"]
+                inp = {"title": "%s (%s)" % (gm["title"] or job["title"], job["label"]),
+                       "details": "\n\n".join(x for x in ((gm["details"] or "").strip(), "%s, of gallery %s." % (note, job["gallery_id"])) if x),
+                       "tag_ids": list(dict.fromkeys([t["id"] for t in gm["tags"]] + [tag])),
+                       "performer_ids": [p["id"] for p in gm["performers"]]}
+                for k in ("date", "photographer"):
+                    if gm.get(k):
+                        inp[k] = gm[k]
+                if gm.get("studio"):
+                    inp["studio_id"] = gm["studio"]["id"]
+                new_gallery = self.stash.gql("mutation($i: GalleryCreateInput!) { galleryCreate(input: $i) { id } }", {"i": inp})["galleryCreate"]["id"]
+            last, made = None, 0
+            for src_id, target in zip(job["image_ids"], outs):
+                if not target:
+                    continue
+                found = self.stash.gql("query($f: ImageFilterType) { findImages(image_filter: $f) { images { id } } }",
+                                       {"f": {"path": {"value": target, "modifier": "EQUALS"}}})["findImages"]["images"]
+                if not found:
+                    continue
+                new = found[0]["id"]
+                src = self.stash.gql("query($id: ID!) { findImage(id: $id) { title date details photographer studio { id } "
+                                     "performers { id } tags { id } galleries { performers { id } studio { id } } } }",
+                                     {"id": src_id})["findImage"]
+                perfs = [p["id"] for p in src["performers"]] or [p["id"] for gg in src["galleries"] for p in gg["performers"]]
+                studio = src["studio"] or next((gg["studio"] for gg in src["galleries"] if gg["studio"]), None)
+                inp = {"id": new, "tag_ids": list(dict.fromkeys([t["id"] for t in src["tags"]] + [tag])),
+                       "performer_ids": list(dict.fromkeys(perfs)),
+                       "details": "\n\n".join(x for x in ((src["details"] or "").strip(), "%s, of image %s." % (note, src_id)) if x)}
+                for k in ("title", "date", "photographer"):
+                    if src.get(k):
+                        inp[k] = src[k]
+                if studio:
+                    inp["studio_id"] = studio["id"]
+                if new_gallery:
+                    inp["gallery_ids"] = [new_gallery]
+                self.stash.gql("mutation($i: ImageUpdateInput!) { imageUpdate(input: $i) { id } }", {"i": inp})
+                last, made = new, made + 1
+            if not made:
+                raise RuntimeError("Stash did not import the new images (in %s)" % job["folder"])
+            failed = remote.get("failed") or []
+            job.update(state="done", progress=1, image=last if not new_gallery else None, gallery=new_gallery,
+                       failed=failed, finished=remote.get("finished") or time.time())
+            log("enhance images (%s): %d made%s -> %s" % (job["label"], made, ", %d failed" % len(failed) if failed else "",
+                                                          ("gallery %s" % new_gallery) if new_gallery else ("image %s" % last)))
+        except Exception as e:
+            traceback.print_exc()
+            job.update(state="error", error="made the images, but importing them failed: %s" % e)
+        job.pop("importing", None)
+
+    def enhance_preview(self, body):
+        """One frame through deinterlace, clean-up and upscale, next to the original
+        (made by the service, copied here for /parallax/file/)."""
+        sid = str(int(body.get("scene_id")))
+        sc, f, scene, markers = self.enhance_scene_info(sid)
+        r = self.enhance_api("POST", "/preview", {"input": f["path"], "time": float(body.get("time") or 0),
+                                                  "settings": body.get("settings") or {}}, timeout=900)
+        out = os.path.join(self.root, "enhance-preview", sid)
+        os.makedirs(out, exist_ok=True)
+        for name in ("before", "after"):
+            with open(os.path.join(out, name + ".jpg"), "wb") as fh:
+                fh.write(self.enhance_api("GET", r[name], raw=True))
+        v = int(time.time())
+        return {"before": "enhance-preview/%s/before.jpg?v=%d" % (sid, v), "after": "enhance-preview/%s/after.jpg?v=%d" % (sid, v),
+                "width": r.get("width"), "height": r.get("height"), "time": r.get("time")}
 
     # ------------------------------------------------------------ upscale images
 
@@ -1128,6 +1559,14 @@ class Parallax:
                 return 200, self.upscale_status(q), None
             if p == "ai-jobs":
                 return 200, self.ai_jobs(), None
+            if p == "enhance":
+                return 200, self.enhance_status(q.get("scene")), None
+            if p == "enhance-image":
+                return 200, self.enhance_image_status(q), None
+            if p in ("enhance/ui/studio.js", "enhance/ui/studio.css", "enhance/ui/image-studio.js"):
+                # the studio is the enhance service's; Stash's CSP only lets the page reach this port
+                return 200, self.enhance_api("GET", "/" + p[len("enhance/"):], raw=True), \
+                    "text/javascript" if p.endswith(".js") else "text/css"
             if p.startswith("file/"):
                 data, ctype = self.file(p[len("file/"):])
                 return 200, data, ctype
@@ -1148,6 +1587,15 @@ class Parallax:
                 return 200, self.start_fps(json.loads(raw or b"{}"))
             if p == "upscale":
                 return 200, self.start_upscale(json.loads(raw or b"{}"))
+            if p == "enhance":
+                return 200, self.start_enhance(json.loads(raw or b"{}"))
+            if p == "enhance-image":
+                return 200, self.start_enhance_image(json.loads(raw or b"{}"))
+            if p in ("enhance-image/probe", "enhance-image/preview", "enhance-image/segment"):
+                fn = {"probe": self.enhance_image_probe, "preview": self.enhance_image_preview, "segment": self.enhance_image_segment}
+                return 200, fn[p.split("/")[1]](json.loads(raw or b"{}"))
+            if p == "enhance/preview":
+                return 200, self.enhance_preview(json.loads(raw or b"{}"))
             m = re.match(r"^export/([a-f0-9]{12})/(start|frames|finish|cancel)$", p)
             if m and m.group(2) == "frames":
                 return 200, self.export_frames(m.group(1), raw)

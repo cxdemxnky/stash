@@ -1,6 +1,6 @@
 // "Queues" page (/queues; /downloader still works) with a tab per queue: Downloads (every
-// downloader job with live progress), Interpolation and Upscaling (the AI jobs from the
-// Parallax plugin's scene, image and gallery buttons), Renders (Parallax exports, which
+// downloader job with live progress), Enhance (Enhance Studio jobs), Interpolation and
+// Upscaling (the older AI frames jobs and image/gallery upscales), Renders (Parallax exports, which
 // render in the browser) and Parallax (projects and exports).
 (function () {
   const { React, GQL, libraries } = window.PluginApi;
@@ -347,6 +347,9 @@
     upscale4: "Image upscale 4×",
   };
   const isUpscale = (j) => j.kind === "upscale" || (j.option || "").startsWith("upscale");
+  const isEnhance = (j) => j.kind === "enhance" || j.kind === "enhance-image";
+  // which queue tab a job shows in
+  const tabOf = (j) => (isEnhance(j) ? "enhance" : isUpscale(j) ? "upscaling" : "interpolation");
   const isActive = (j) => ["queued", "running", "cancelling"].includes(j.state);
 
   function duration(s) {
@@ -374,9 +377,13 @@
 
   function AIJob({ job, base, token, reload }) {
     const [armed, setArmed] = React.useState(false);
-    const label = job.kind === "upscale" ? `${job.gallery_id ? "Gallery" : "Image"} upscale ${job.factor}×` : OPTION_LABELS[job.option] || job.option;
-    const source = job.gallery_id ? h(Link, { to: `/galleries/${job.gallery_id}` }, job.title || `Gallery ${job.gallery_id}`)
+    const label = job.kind === "upscale" ? `${job.gallery_id ? "Gallery" : "Image"} upscale ${job.factor}×`
+      : isEnhance(job) ? job.label : OPTION_LABELS[job.option] || job.option;
+    const source = job.kind === "enhance-image"
+      ? h(Link, { to: `/enhance-image?${job.gallery_id ? `gallery=${job.gallery_id}` : `image=${job.image_id}`}` }, job.title || "Images")
+      : job.gallery_id ? h(Link, { to: `/galleries/${job.gallery_id}` }, job.title || `Gallery ${job.gallery_id}`)
       : job.image_id ? h(Link, { to: `/images/${job.image_id}` }, job.title || `Image ${job.image_id}`)
+      : isEnhance(job) ? h(Link, { to: `/enhance?scene=${job.scene_id}` }, job.title || `Scene ${job.scene_id}`)
       : h(Link, { to: `/scenes/${job.scene_id}${job.marker ? `?t=${Math.floor(job.marker.start)}` : ""}` }, job.title || `Scene ${job.scene_id}`);
     const result = job.state !== "done" ? null
       : job.gallery ? h(Link, { to: `/galleries/${job.gallery}`, className: "dl-ai-open" }, "Open the new gallery")
@@ -387,7 +394,7 @@
       fetch(`${base}/parallax/fps/${job.id}/cancel`, { method: "POST", headers: { "X-Token": token } }).then(reload);
     };
     const pct = Math.round((job.progress || 0) * 100);
-    const unit = job.kind === "upscale" ? "images" : "frames";
+    const unit = job.kind === "upscale" || job.kind === "enhance-image" ? "images" : isEnhance(job) ? "source frames" : "frames";
     return h(
       "div",
       { className: `dl-item dl-ai-${job.state}` },
@@ -415,7 +422,7 @@
   }
 
   function AIJobsTab({ base, token, ai, which }) {
-    const jobs = (ai.jobs || []).filter((j) => (which === "upscaling" ? isUpscale(j) : !isUpscale(j)));
+    const jobs = (ai.jobs || []).filter((j) => tabOf(j) === which);
     const order = { running: 0, cancelling: 0, queued: 1 };
     jobs.sort((a, b) => (order[a.state] ?? 2) - (order[b.state] ?? 2) || b.created - a.created);
     const active = jobs.filter(isActive).filter((j) => j.state !== "cancelling")
@@ -427,8 +434,11 @@
       ai.reload();
     };
     const hint = which === "upscaling"
-      ? "AI upscaling (Real-ESRGAN): the Upscale buttons on image and gallery pages, and Upscale 2× in a scene's AI frames menu."
-      : "AI frames (RIFE): a smoother, higher frame rate, slow motion or marker clips, from the AI frames button on scene pages.";
+      ? "AI upscaling of images (Real-ESRGAN) made by the old Upscale buttons; images and galleries are now enhanced with their Enhance buttons."
+      : which === "enhance"
+      ? h(React.Fragment, null, "Enhance Studio jobs: deinterlace, clean up, upscale and change the frame rate of scenes; and the image studio's ",
+          "(the Enhance button on image and gallery pages). ", h(Link, { to: "/enhance" }, "Open Enhance Studio"), ".")
+      : "AI frames (RIFE) made by the old scene-page menu; new ones are made in Enhance Studio.";
     return h(
       "div",
       null,
@@ -561,8 +571,8 @@
 
   // ---------------------------------------------------------------- the page
 
-  const TABS = [["downloads", "Downloads"], ["interpolation", "Interpolation"], ["upscaling", "Upscaling"], ["renders", "Renders"],
-    ["parallax", "Parallax"]];
+  const TABS = [["downloads", "Downloads"], ["enhance", "Enhance"], ["interpolation", "Interpolation"], ["upscaling", "Upscaling"],
+    ["renders", "Renders"], ["parallax", "Parallax"]];
 
   function QueuesPage() {
     const { base, token } = usePluginSettings();
@@ -571,14 +581,14 @@
     const tab = new URLSearchParams(location.search).get("tab") || "downloads";
     const ai = useAIJobs(base);
     const rd = useRenders();
-    const busy = (which) => (ai.jobs || []).filter((j) => isActive(j) && (which === "upscaling" ? isUpscale(j) : !isUpscale(j))).length;
+    const busy = (which) => (ai.jobs || []).filter((j) => isActive(j) && tabOf(j) === which).length;
     return h(
       "div",
       { className: "dl-page" },
       h("h2", null, "Queues"),
       h("div", { className: "dl-tabs" },
         TABS.map(([k, label]) => {
-          const n = k === "interpolation" || k === "upscaling" ? busy(k)
+          const n = k === "interpolation" || k === "upscaling" || k === "enhance" ? busy(k)
             : k === "renders" ? rd.renders.filter((r) => renderRunning(r) && !renderStalled(r)).length : 0;
           return h("button", {
             key: k, className: "dl-tab" + (tab === k ? " active" : ""),
