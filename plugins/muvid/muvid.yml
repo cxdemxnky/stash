@@ -1,0 +1,16 @@
+name: MuVid
+description: Music videos cut on the beat from your videos. Send all of the library, or the scenes with some tags, to MuVid with a piece of music (a scene, or a file on the disk); the edit opens in MuVid's studio, and exports come back as scenes tagged "MuVid". MuVid is its own service (port 10144), reached through the downloader service.
+version: 1.0.0
+ui:
+  javascript:
+    - muvid.js
+  css:
+    - muvid.css
+  csp:
+    connect-src:
+      - "http://*:10141"
+settings:
+  muvid_url:
+    displayName: MuVid address
+    description: Where MuVid's web app is, for opening the studio (default http://<this host>:10144).
+    type: STRING

@@ -9,6 +9,7 @@ Standard library only; HLS streams are downloaded with ffmpeg. Performer names a
 read from end credits by credits.py, run with a separate OCR venv (--ocr-python).
 Parallax Studio, Enhance Studio and the AI jobs (/parallax/...) are in parallax_service.py:
 the studios relay to their own services (parallax and enhance), which call back here.
+MuVid (music videos cut on the beat from Stash's videos, /muvid/...) is in muvid_service.py.
 
 Job format (POST /jobs):
 {
@@ -46,6 +47,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from parallax_service import Parallax
+from muvid_service import MuVid
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -1070,6 +1072,8 @@ def make_handler(svc):
             if self.path.startswith("/parallax/"):
                 code, body, ctype = svc.parallax.get(self.path)
                 self.send(code, body, ctype or "application/json")
+            elif self.path.startswith("/muvid/"):
+                self.send(*svc.muvid.get(self.path))
             elif self.path == "/":
                 self.send(200, STATUS_PAGE, "text/html; charset=utf-8")
             elif self.path == "/status":
@@ -1098,7 +1102,9 @@ def make_handler(svc):
             except ValueError:
                 self.send(400, {"error": "invalid json"})
                 return
-            if self.path == "/jobs":
+            if self.path.startswith("/muvid/"):
+                self.send(*svc.muvid.post(self.path, body))
+            elif self.path == "/jobs":
                 res = svc.enqueue(body)
                 log("job from %s: %s" % (body.get("site"), res))
                 self.send(200, res)
@@ -1202,6 +1208,7 @@ def main():
     # the AI frames and upscale jobs run their models with onnxruntime + opencv: on the
     # GPU when the GPU venv is installed and works, else with the OCR venv's python on the CPU
     svc.parallax = Parallax(svc.stash, parallax_python(args), args.models_dir, args.parallax_dir, svc.media_dir, http_request)
+    svc.muvid = MuVid(svc.stash, args.parallax_dir, svc.media_dir)
     for _ in range(svc.fixed_workers or MAX_WORKERS):
         threading.Thread(target=svc.run, daemon=True).start()
     threading.Thread(target=svc.tune, daemon=True).start()
