@@ -179,7 +179,13 @@
     const b = useBackend();
     const [list, setList] = React.useState(null);
     const [error, setError] = React.useState(null);
+    const [retag, setRetag] = React.useState({}); // project id -> what happened
     React.useEffect(() => { api("projects").then(setList, (e) => setError(e.message)); }, []);
+    const refreshTags = (pid) => {
+      setRetag((r) => ({ ...r, [pid]: "…" }));
+      api("retag", { project: pid }).then((res) => setRetag((r) => ({ ...r, [pid]: `${res.retagged} updated` })),
+        (e) => setRetag((r) => ({ ...r, [pid]: e.message })));
+    };
     return h("div", { className: "muv-page" },
       h("div", { className: "muv-row" },
         h("h2", null, "MuVid"),
@@ -200,7 +206,9 @@
           h("div", { className: "muv-row muv-small" },
             b && h("a", { href: studioUrl(b.muvid, p.id), target: "_blank", rel: "noreferrer" }, "Open the studio ↗"),
             p.scene_id && h(Link, { to: `/scenes/${p.scene_id}` }, "The export"),
-            h(Link, { to: `/muvid/add/${p.id}` }, "+ Add videos")))))));
+            h(Link, { to: `/muvid/add/${p.id}` }, "+ Add videos"),
+            h("a", { href: "#", title: "Send the videos' tags (as they are in Stash now) to the studio", onClick: (e) => { e.preventDefault(); refreshTags(p.id); } }, "Refresh tags"),
+            retag[p.id] && h("span", { className: "text-muted" }, retag[p.id])))))));
   }
 
   function NewProject({ tag }) {

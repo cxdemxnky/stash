@@ -21,10 +21,12 @@ POST /muvid/count                        {videos} -> {count, duration}
 POST /muvid/project                      {videos, music: {scene_id} | {path}, use_video?, title?, settings?, gen?}
                                          -> {project, job}
 POST /muvid/add                          {project, videos} -> {added, job}
+POST /muvid/retag                        {project} -> {retagged, matched}: its videos' tags, from Stash again
 POST /muvid/callback                     {event: "exported", project, export}: MuVid reporting an export
                                          (X-Token needed) -> {link, scene_id}
 
 videos: {all: true} or {tags: [id], match: "any"|"all", sub: bool}, plus exclude: [tag id] for either.
+Each video goes to MuVid with its scene's tags (names), which the studio shows and can fill a section from.
 """
 import json
 import os
@@ -99,7 +101,7 @@ class MuVid:
         return out
 
     def scenes(self, videos):
-        """[(scene id, path, duration)] of the scenes a selection names, leaving out
+        """[(scene id, path, duration, tags)] of the scenes a selection names, leaving out
         MuVid's own exports."""
         if not isinstance(videos, dict):
             raise ValueError("videos must be {all: true} or {tags: [...]}")
@@ -114,17 +116,18 @@ class MuVid:
         if exclude:
             f["NOT"] = {"tags": {"value": exclude, "modifier": "INCLUDES", "depth": -1 if videos.get("sub") else 0}}
         rows = self.stash.gql("query($f: SceneFilterType) { findScenes(scene_filter: $f, filter: {per_page: -1}) "
-                              "{ scenes { id files { path duration } } } }", {"f": f})["findScenes"]["scenes"]
+                              "{ scenes { id files { path duration } tags { name } } } }", {"f": f})["findScenes"]["scenes"]
         own = os.path.join(self.media_dir, MUVID_DIR) + os.sep
         out = []
         for s in rows:
             if s["files"] and not s["files"][0]["path"].startswith(own):
-                out.append((s["id"], s["files"][0]["path"], float(s["files"][0]["duration"] or 0)))
+                out.append((s["id"], s["files"][0]["path"], float(s["files"][0]["duration"] or 0),
+                            sorted({t["name"] for t in s.get("tags") or []}, key=str.lower)))
         return out
 
     def count(self, body):
         rows = self.scenes(body.get("videos"))
-        return {"count": len(rows), "duration": round(sum(d for _, _, d in rows), 1)}
+        return {"count": len(rows), "duration": round(sum(r[2] for r in rows), 1)}
 
     def music_scenes(self, q):
         rows = self.stash.gql("query($q: String) { findScenes(filter: {q: $q, per_page: 25, sort: \"title\"}) "
@@ -169,7 +172,7 @@ class MuVid:
         what = self.describe(videos)
         res = self.api("POST", "/project", {
             "music": {"path": path, "video": bool(body.get("use_video"))},
-            "sources": [p for _, p, _ in rows if p != path],
+            "sources": [{"path": p, "tags": tags} for _, p, _, tags in rows if p != path],
             "title": body.get("title") or title,
             "settings": body.get("settings") or {}, "gen": body.get("gen") or {},
             "output": out,
@@ -185,8 +188,23 @@ class MuVid:
         rows = self.scenes(body.get("videos") or {})
         if not rows:
             raise ValueError("no videos match")
-        res = self.api("POST", "/project/%s/sources" % urllib.parse.quote(pid), {"add": [p for _, p, _ in rows]}, timeout=120)
+        res = self.api("POST", "/project/%s/sources" % urllib.parse.quote(pid),
+                       {"add": [{"path": p, "tags": tags} for _, p, _, tags in rows]}, timeout=120)
         return {"added": res.get("added", 0), "job": res.get("job"), "matched": len(rows)}
+
+    def retag(self, body):
+        """Bring a project's videos' tags up to date with Stash's (videos that aren't in
+        Stash keep theirs)."""
+        pid = str(body.get("project") or "")
+        p = self.api("GET", "/project/%s" % urllib.parse.quote(pid))
+        have = {s["path"] for s in p.get("sources") or [] if not s.get("cut") and not s.get("enhanced")}
+        rows = self.scenes({"all": True})
+        add = [{"path": path, "tags": tags} for _, path, _, tags in rows if path in have]
+        if not add:
+            return {"retagged": 0, "matched": 0}
+        res = self.api("POST", "/project/%s/sources" % urllib.parse.quote(pid), {"add": add}, timeout=120)
+        log("project %s: tags for %d videos (%d changed)" % (pid, len(add), res.get("retagged", 0)))
+        return {"retagged": res.get("retagged", 0), "matched": len(add)}
 
     def projects(self):
         exports = read_json(self.exports_path(), {}) or {}
@@ -272,6 +290,8 @@ class MuVid:
                 return 200, self.create_project(body)
             if p == "add":
                 return 200, self.add(body)
+            if p == "retag":
+                return 200, self.retag(body)
             if p == "callback":
                 return 200, self.callback(body)
         except KeyError as e:
