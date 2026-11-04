@@ -1,4 +1,4 @@
-// "Shows" section: /shows lists groups tagged "Show"; /shows/<groupId> lists the
+// "Shows" section: /shows lists groups tagged "Show" but not "Movie", A–Z; /shows/<groupId> lists the
 // group's scenes by season and episode. The downloader stores episodes as group
 // scenes with scene_index = season * 1000 + episode and code "S01E02".
 // "Movies" section: /movies lists the scenes tagged "Movie" (each one a film);
@@ -62,13 +62,16 @@
 
   function ShowList() {
     const tag = useShowTagId();
-    const [sort, setSort] = React.useState("created_at");
+    const movieTag = useTagId(MOVIE_TAG);
+    const [sort, setSort] = React.useState("name");
     const [q, setQ] = React.useState("");
     const { data, loading } = GQL.useFindGroupsQuery({
-      skip: !tag.id,
+      skip: !tag.id || movieTag.loading,
       variables: {
         filter: { per_page: -1, sort, direction: sort === "name" ? "ASC" : "DESC", q },
-        group_filter: { tags: { value: [tag.id], modifier: "INCLUDES" } },
+        group_filter: {
+          tags: { value: [tag.id], excludes: movieTag.id ? [movieTag.id] : [], modifier: "INCLUDES" },
+        },
       },
     });
     const groups = data?.findGroups.groups ?? [];
@@ -93,8 +96,8 @@
           h(
             "select",
             { className: "shows-sort", value: sort, onChange: (e) => setSort(e.target.value) },
-            h("option", { value: "created_at" }, "Most Recent"),
             h("option", { value: "name" }, "A–Z"),
+            h("option", { value: "created_at" }, "Most Recent"),
             h("option", { value: "scenes_count" }, "Most Episodes")
           )
         )

@@ -1,5 +1,5 @@
 name: Shows
-description: A "Shows" section listing groups tagged "Show" with their seasons and episodes, and a "Movies" section listing scenes tagged "Movie", styled after PlayboyTV.
+description: A "Shows" section listing groups tagged "Show" (but not "Movie") with their seasons and episodes, and a "Movies" section listing scenes tagged "Movie", styled after PlayboyTV.
 version: 1.0.0
 ui:
   javascript:
