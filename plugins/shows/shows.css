@@ -345,3 +345,10 @@
   color: #000;
   font-size: 14px;
 }
+
+/* movies: scenes tagged "Movie", in the shows' style */
+.movies-card-image { padding-top: 56.25%; }
+.movies-card-sub { font-size: 12px; opacity: 0.8; margin-top: 2px; }
+.movies-cast a { color: inherit; text-decoration: underline; }
+.movies-more { font-family: var(--shows-display); font-size: 1.4rem; letter-spacing: 1px; text-transform: uppercase; margin: 28px 0 12px; padding: 0 16px; }
+.movies-more-grid { padding: 0 16px; }

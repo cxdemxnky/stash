@@ -1,25 +1,29 @@
 // "Shows" section: /shows lists groups tagged "Show"; /shows/<groupId> lists the
 // group's scenes by season and episode. The downloader stores episodes as group
 // scenes with scene_index = season * 1000 + episode and code "S01E02".
+// "Movies" section: /movies lists the scenes tagged "Movie" (each one a film);
+// /movies/<sceneId> is the film's page, styled like a show's.
 (function () {
   const { React, GQL, libraries } = window.PluginApi;
   const { Link, useLocation } = libraries.ReactRouterDOM;
   const { FontAwesomeIcon } = libraries.ReactFontAwesome;
-  const { faTv, faEye } = libraries.FontAwesomeSolid;
+  const { faTv, faEye, faFilm } = libraries.FontAwesomeSolid;
   const { Nav, Button } = libraries.Bootstrap;
   const h = React.createElement;
 
   const SHOW_TAG = "Show";
+  const MOVIE_TAG = "Movie";
 
-  function useShowTagId() {
+  function useTagId(name) {
     const { data, loading } = GQL.useFindTagsQuery({
       variables: {
         filter: { per_page: 1 },
-        tag_filter: { name: { value: SHOW_TAG, modifier: "EQUALS" } },
+        tag_filter: { name: { value: name, modifier: "EQUALS" } },
       },
     });
     return { loading, id: data?.findTags.tags[0]?.id };
   }
+  const useShowTagId = () => useTagId(SHOW_TAG);
 
   function category(group) {
     const t = (group.tags || []).find((t) => t.name !== SHOW_TAG);
@@ -229,6 +233,140 @@
 
   window.PluginApi.register.route("/shows", ShowsRoute);
 
+  // ---------------------------------------------------------------- movies
+
+  // a film's name and the part after it: its group's name (where it's one, as the downloader
+  // files them: "Close to Me S01E01 · Louis"), else the scene's title
+  function movieTitle(scene) {
+    const g = scene.groups && scene.groups[0] && scene.groups[0].group;
+    const t = scene.title || (scene.files[0] && scene.files[0].basename) || "Untitled";
+    if (g) {
+      const rest = t.startsWith(g.name) ? t.slice(g.name.length).replace(/^\s*S\d+E\d+\s*/i, "").replace(/^\s*·\s*/, "") : t;
+      return { title: g.name, sub: rest !== g.name ? rest : "" };
+    }
+    const m = /^(.*?)\s*·\s*(.*)$/.exec(t);
+    return m ? { title: m[1], sub: m[2] } : { title: t, sub: "" };
+  }
+  const movieLabel = (scene) => (scene.studio && scene.studio.name) || "";
+  const year = (d) => (d ? String(d).slice(0, 4) : "");
+
+  function MovieCard({ scene }) {
+    const { title, sub } = movieTitle(scene);
+    return h(
+      Link,
+      { to: `/movies/${scene.id}`, className: "shows-card movies-card" },
+      h("div", { className: "shows-card-image movies-card-image", style: { backgroundImage: `url("${scene.paths.screenshot}")` } }),
+      h(
+        "div",
+        { className: "shows-card-caption" },
+        movieLabel(scene) && h("div", { className: "shows-category" }, movieLabel(scene)),
+        h("div", { className: "shows-card-title" }, title),
+        h("div", { className: "movies-card-sub" }, [year(scene.date), sub, scene.files[0] ? formatDuration(scene.files[0].duration) : ""].filter(Boolean).join("  ·  "))
+      )
+    );
+  }
+
+  const MOVIE_SORTS = {
+    date: { sort: "date", direction: "DESC" },
+    created_at: { sort: "created_at", direction: "DESC" },
+    title: { sort: "title", direction: "ASC" },
+    duration: { sort: "duration", direction: "DESC" },
+    play_count: { sort: "play_count", direction: "DESC" },
+  };
+
+  function MovieList() {
+    const tag = useTagId(MOVIE_TAG);
+    const [sort, setSort] = React.useState("created_at");
+    const [q, setQ] = React.useState("");
+    const { data, loading } = GQL.useFindScenesQuery({
+      skip: !tag.id,
+      variables: {
+        filter: { per_page: -1, q, ...MOVIE_SORTS[sort] },
+        scene_filter: { tags: { value: [tag.id], modifier: "INCLUDES" } },
+      },
+    });
+    const scenes = data?.findScenes.scenes ?? [];
+    return h(
+      "div",
+      { className: "shows-page" },
+      h("h1", { className: "shows-heading" }, "Movies"),
+      h(
+        "div",
+        { className: "shows-toolbar" },
+        h("span", null, loading || tag.loading ? "Loading…" : `${scenes.length} Results Found`),
+        h(
+          "span",
+          null,
+          h("input", { className: "shows-search", placeholder: "Search...", value: q, onChange: (e) => setQ(e.target.value) }),
+          h(
+            "select",
+            { className: "shows-sort", value: sort, onChange: (e) => setSort(e.target.value) },
+            h("option", { value: "created_at" }, "Most Recent"),
+            h("option", { value: "date" }, "Release Date"),
+            h("option", { value: "title" }, "A–Z"),
+            h("option", { value: "duration" }, "Longest"),
+            h("option", { value: "play_count" }, "Most Viewed")
+          )
+        )
+      ),
+      !tag.loading && !tag.id
+        ? h("p", { className: "shows-empty" }, `No movies yet. Movies are scenes tagged "${MOVIE_TAG}".`)
+        : h("div", { className: "shows-grid" }, scenes.map((s) => h(MovieCard, { key: s.id, scene: s })))
+    );
+  }
+
+  function MovieDetail({ id }) {
+    const res = GQL.useFindSceneQuery({ variables: { id } });
+    const scene = res.data?.findScene;
+    const tag = useTagId(MOVIE_TAG);
+    const more = GQL.useFindScenesQuery({
+      skip: !tag.id,
+      variables: { filter: { per_page: 12, sort: "random" }, scene_filter: { tags: { value: [tag.id], modifier: "INCLUDES" } } },
+    });
+    if (res.loading) return h("div", { className: "shows-page" }, "Loading…");
+    if (!scene) return h("div", { className: "shows-page" }, "Movie not found.");
+    const { title, sub } = movieTitle(scene);
+    const group = scene.groups && scene.groups[0] && scene.groups[0].group;
+    const file = scene.files[0];
+    const others = (more.data?.findScenes.scenes ?? []).filter((s) => s.id !== scene.id).slice(0, 10);
+    const facts = [year(scene.date), file && formatDuration(file.duration), file && file.height ? `${file.height}p` : ""].filter(Boolean).join("  ·  ");
+    return h(
+      "div",
+      { className: "shows-detail" },
+      h(
+        "div",
+        { className: "shows-hero" },
+        h("img", { className: "shows-hero-img", src: scene.paths.screenshot, alt: "" }),
+        h(
+          "div",
+          { className: "shows-hero-content" },
+          movieLabel(scene) && h("div", { className: "shows-hero-category" }, movieLabel(scene)),
+          h("h1", { className: "shows-hero-title" }, title),
+          sub && h("div", { className: "shows-hero-sub" }, sub),
+          h(Link, { to: `/scenes/${scene.id}`, className: "shows-watch" }, h("span", { className: "shows-watch-icon" }, "\u25B6\uFE0E"), "Watch movie"),
+          facts && h("div", { className: "shows-hero-meta" }, facts),
+          h("div", { className: "shows-hero-meta shows-hero-stats" }, h(FontAwesomeIcon, { icon: faEye }), ` ${scene.play_count ?? 0}`),
+          scene.performers && scene.performers.length > 0 &&
+            h("div", { className: "shows-hero-meta movies-cast" }, "Starring ",
+              scene.performers.slice(0, 8).map((pf, i) => h(React.Fragment, { key: pf.id }, i ? ", " : "", h(Link, { to: `/performers/${pf.id}` }, pf.name)))),
+          (scene.details || (group && group.synopsis)) && h("p", { className: "shows-synopsis" }, scene.details || group.synopsis),
+          group && h("div", { className: "shows-hero-meta" }, h(Link, { to: `/shows/${group.id}` }, `More from ${group.name} \u2192`))
+        )
+      ),
+      others.length > 0 && h("h2", { className: "movies-more" }, "More movies"),
+      others.length > 0 && h("div", { className: "shows-grid movies-more-grid" }, others.map((s) => h(MovieCard, { key: s.id, scene: s }))),
+      h("div", { className: "shows-detail-footer" }, h(Link, { to: "/movies", className: "shows-back" }, "\u2190 All movies"))
+    );
+  }
+
+  function MoviesRoute() {
+    const location = useLocation();
+    const m = /^\/movies\/(\d+)/.exec(location.pathname);
+    return m ? h(MovieDetail, { id: m[1], key: m[1] }) : h(MovieList);
+  }
+
+  window.PluginApi.register.route("/movies", MoviesRoute);
+
   // add "Shows" to the main navbar, after the built-in items
   window.PluginApi.patch.before("MainNavBar.MenuItems", function (props) {
     const item = h(
@@ -248,6 +386,23 @@
         )
       )
     );
-    return [{ ...props, children: h(React.Fragment, null, props.children, item) }];
+    const movies = h(
+      Nav.Link,
+      { key: "movies", eventKey: "/movies", as: "div", className: "col-4 col-sm-3 col-md-2 col-lg-auto" },
+      h(
+        Link,
+        { to: "/movies" },
+        h(
+          Button,
+          {
+            className:
+              "minimal p-4 p-xl-2 d-flex d-xl-inline-block flex-column justify-content-between align-items-center",
+          },
+          h(FontAwesomeIcon, { icon: faFilm, className: "nav-menu-icon d-block d-xl-inline mb-2 mb-xl-0 mr-xl-1" }),
+          h("span", null, "Movies")
+        )
+      )
+    );
+    return [{ ...props, children: h(React.Fragment, null, props.children, item, movies) }];
   });
 })();
